@@ -12,7 +12,7 @@ import requests
 
 # ===== 0) Import extractor =====
 try:
-    from source.infer_concurent_pytorch import VideoKeyframeExtractor
+    from infer_concurent_pytorch import VideoKeyframeExtractor
 except ImportError as e:
     logging.error("Không thể import VideoKeyframeExtractor từ infer_concurrent_autoshot.py.")
     raise e
