@@ -253,7 +253,7 @@ def main_loop(server_url: str, videos_dir: Path, mode: Literal['local', 'colab']
         sample_rate=WorkerConfig.SAMPLE_RATE,
         max_frames_per_shot=WorkerConfig.MAX_FRAMES_PER_SHOT,
         base_url=base_url,
-        colab=(mode == "colab")
+        # colab=(mode == "colab")
     )
     logging.info("Extractor sẵn sàng.")
 
@@ -366,13 +366,13 @@ if __name__ == "__main__":
         description="Worker xử lý video, trích xuất keyframe và gửi kết quả về server.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
-    parser.add_argument("--server-url", type=str, default="http://127.0.0.1:6661",
-                        help="URL Task Dispatcher Server (vd: http://host:6661)")
+    parser.add_argument("--server-url", type=str, default="http://127.0.0.1:6060",
+                        help="URL Task Dispatcher Server (vd: http://host:6060)")
     parser.add_argument("--videos-dir", type=str, required=True,
                         help="Thư mục chứa video nguồn (share được cho worker).")
     parser.add_argument("--mode", type=str, choices=["local", "colab"], default="colab",
                         help="local: ghi trực tiếp vào result_path và /report_done; colab: upload Base64.")
-    parser.add_argument("--base-url", type=str, default="http://159.223.81.229:8000",
+    parser.add_argument("--base-url", type=str, default="http://159.223.81.229:9600",
                         help="Tham số truyền cho extractor (nếu có dùng).")
 
     args = parser.parse_args()

@@ -226,11 +226,6 @@ class BaseKeyManager:
                     key_info = free_keys[self._current_key_index]
                     self._in_use_tokens.add(key_info['token']) # LOCK
                     return key_info
-                if self._retired_keys and (time.monotonic() - start_wait_time > self.emergency_revival_timeout):
-                    console.print(f"[{self.provider_name} KeyManager] ⚠️ No keys available for over {self.emergency_revival_timeout}s. Triggering emergency revival.", style="bold yellow")
-                    self._emergency_revive_all_keys()
-                    start_wait_time = time.monotonic()  # Reset the timer
-                    continue  # Restart the loop to select a newly revived key
                 if not self._active_keys and not self._retired_keys:
                     self._emergency_revive_all_keys() # The `select_key` method calls the emergency function.
                     # raise NoAvailableKeysError(f"All {self.provider_name} keys removed.")
@@ -598,6 +593,7 @@ class GeneratorGemini:
 # --- Configuration ---
 MISTRAL_SHEET_URL = os.getenv("MISTRAL_SHEET_URL", "https://docs.google.com/spreadsheets/d/1NAlj7OiD9apH3U47RLJK0en1wLSW78X5zqmf6NmVUA4/export?format=csv&gid=0")
 GEMINI_SHEET_URL = os.getenv("GEMINI_SHEET_URL", "https://docs.google.com/spreadsheets/d/1gqlLToS3OXPA-CvfgXRnZ1A6n32eXMTkXz4ghqZxe2I/export?format=csv&gid=0")
+# GEMINI_SHEET_URL = os.getenv("GEMINI_SHEET_URL", "https://docs.google.com/spreadsheets/d/1Lm4C27XX9rIMT8V1Z4oFHwit_mXNk2LdqvNUXhKoYS0/export?format=csv&gid=0")
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", 9600))
 MAX_CONCURRENT_REQUESTS = 100
@@ -1129,7 +1125,7 @@ async def init_app() -> web.Application:
             # You can set a different rate limit for Gemini keys if needed.
             gemini_key_manager = GeminiApiKeyManager(
                 sheet_url=GEMINI_SHEET_URL,
-                key_rpm=10 
+                key_rpm=900 
             )
             gemini_rate_limiter = AsyncTokenBucket(
                 rate=GEMINI_RPM_RATE,

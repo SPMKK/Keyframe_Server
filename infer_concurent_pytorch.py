@@ -1,7 +1,7 @@
 import os
 import sys
 import numpy as np
-import tensorflow as tf
+# import tensorflow as tf
 import torch
 import clip
 import cv2
@@ -47,40 +47,13 @@ API_KEY_MISTRAL = MistralApiKeyManager(
     sheet_url=MISTRAL_SHEET_URL
 ).get_active_key_count()
 OCR_PROMPT = '''
-You are an OCR agent specialized in extracting text in both **Vietnamese** and **English**.
+Perform OCR on the provided image. Return only the text detected in the image as a single continuous string with words separated by exactly one space. Do not insert line breaks, punctuation, or extra commentary.
 
-Your task is to:
-
-- Accurately detect and extract **all visible text** from each input image, including:
-  - 📰 **Main headline / title**
-  - 📝 **Subheadings / captions**
-  - 📄 **Body text or any other readable content**
-- Extract all text even if it is a logo, banner, or any other form of text.
-- Preserve the **natural reading order** (top to bottom, left to right).
-- Recognize both **Vietnamese (without diacritics)** and **English** text.
-- **Do not translate** the text—just extract it **verbatim** as it appears.
-- If an image contains **no readable text**, return an empty string for that frame.
-- Input is a **batch of images**, typically extracted from a video (e.g., keyframes).
-- Output the extracted texts without diacritics in a **structured format**, preserving the input order.
-- For any truncated, partially visible, or occluded text, include **only the visible portions** without guessing the rest.  
-
----
-
-### 📤 Input
-A list of image frames, ordered as they appear in the video:
-python
-["frame_0001.jpg", "frame_0002.jpg", ..., "frame_N.jpg"]
-
-**Return answer in this json format, no additional word:**
-{
-    "extracted_texts": [
-        "Text from frame_0001",
-        "Text from frame_0002",
-        ...
-        "Text from frame_N"
-    ]
-}
-
+- Accurately extract all visible characters, even if they are small, low-contrast, partially occluded, distorted, or angled.  
+- Prioritize detecting text from signboards, banners, posters, or other high-importance areas.  
+- For each character, use only what is clearly visible - DO NOT guess or reconstruct missing parts.  
+- Preserve the original order of words as they appear spatially from top-to-bottom and left-to-right.    
+- If no readable text is present, return empty double quotes (`""`).
 '''
 
 class TransNetV2(nn.Module):
@@ -443,7 +416,7 @@ class VideoKeyframeExtractor:
             ret, frame = cap.read()
             if not ret: break
             if frame_idx % self.sample_rate == 0:
-                frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)) 
                 frame_indices.append(frame_idx)
             frame_idx += 1
         cap.release()
@@ -586,28 +559,13 @@ class VideoKeyframeExtractor:
                     try:
                         # Giữ nguyên ảnh, KHÔNG crop
                         response_str, _ = ocr_model.generate(
-                            model_name="gemini-2.5-flash",
+                            model_name="gemini-2.5-flash-lite",
                             images=[img],          # gửi 1 ảnh/lần
                             prompt=OCR_PROMPT,
                             temperature=0.0,
                         )
 
-                        # Thử bóc JSON
-                        response_json = self._extract_json_from_response(response_str)
-
-                        # Chấp nhận cả 2 kiểu:
-                        # 1) {"extracted_texts": ["..."]}  (chuẩn theo prompt)
-                        # 2) Trả về chuỗi text thuần (fallback)
-                        text_val = ""
-                        if isinstance(response_json, dict) and "extracted_texts" in response_json:
-                            arr = response_json.get("extracted_texts", [])
-                            if isinstance(arr, list) and len(arr) > 0 and isinstance(arr[0], str):
-                                text_val = arr[0].strip()
-                        elif isinstance(response_str, str):
-                            # Fallback: lấy thẳng chuỗi (trong trường hợp model không trả JSON)
-                            text_val = response_str.strip()
-
-                        ocr_results[i] = text_val or ""
+                        ocr_results[i] = response_str or ""
 
                     except Exception as ee:
                         print(f"[WARNING] OCR failed for index {i}: {ee}")
@@ -930,7 +888,7 @@ class VideoKeyframeExtractor:
         except Exception as e:
             print(f"[ERROR] Could not initialize OCR model: {e}. Post-processing will skip OCR.")
         try:
-            caption_model = Generator(base_url='http://0.0.0.0:9600', api_key=API_KEY_MISTRAL)
+            caption_model = None
             print("[PIPELINE] Caption model initialized successfully.")
         except Exception as e:
             print(f"[ERROR] Could not initialize Caption model: {e}. Post-processing will skip captioning.")
