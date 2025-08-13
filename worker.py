@@ -12,9 +12,9 @@ import requests
 
 # ===== 0) Import extractor =====
 try:
-    from source.infer_concurent_pytorch import VideoKeyframeExtractor
+    from infer_concurent_pytorch import VideoKeyframeExtractor
 except ImportError as e:
-    logging.error("Không thể import VideoKeyframeExtractor từ infer_concurrent_autoshot.py.")
+    logging.error("Không thể import VideoKeyframeExtractor từ infer_concurent_pytorch.py.")
     raise e
 
 
@@ -29,7 +29,7 @@ class WorkerConfig:
     POLL_INTERVAL_SECONDS: int = 10
 
     # Số ảnh gửi mỗi batch base64
-    BASE64_BATCH_SIZE: int = 8
+    BASE64_BATCH_SIZE: int = 4
 
     # Timeout HTTP
     REQ_TIMEOUT_GET: int = 15
@@ -252,7 +252,8 @@ def main_loop(server_url: str, videos_dir: Path, mode: Literal['local', 'colab']
         output_dir=str(WorkerConfig.WORKING_DIR),
         sample_rate=WorkerConfig.SAMPLE_RATE,
         max_frames_per_shot=WorkerConfig.MAX_FRAMES_PER_SHOT,
-        base_url=base_url
+        base_url=base_url,
+        colab=(mode == "colab")
     )
     logging.info("Extractor sẵn sàng.")
 
@@ -290,7 +291,17 @@ def main_loop(server_url: str, videos_dir: Path, mode: Literal['local', 'colab']
                 extractor.output_dir = str(result_path.parent)  # extractor có thể tạo subdir <video_id>, ta chỉnh lại:
                 extractor.output_dir = str(result_path)         # => đảm bảo file nằm trong chính result_path
                 extractor.extract_keyframes(str(src_video))
-
+                # Sau khi extract xong:
+                produced_dir = WorkerConfig.WORKING_DIR / Path(filename).stem
+                target_dir   = WorkerConfig.WORKING_DIR / video_id
+                try:
+                    if produced_dir.exists() and produced_dir.is_dir() and produced_dir != target_dir:
+                        if target_dir.exists():
+                            shutil.rmtree(target_dir, ignore_errors=True)
+                        shutil.move(str(produced_dir), str(target_dir))
+                        logging.info(f"Đổi tên thư mục kết quả {produced_dir.name} -> {video_id}")
+                except Exception as e:
+                    logging.error(f"Lỗi đổi tên thư mục kết quả: {e}")
                 # Chuẩn hoá layout ngay tại result_path
                 if normalize_result_layout(result_path.parent if result_path.name == video_id else result_path, video_id) is None:
                     logging.error("Chuẩn hoá layout thất bại (local).")
@@ -313,11 +324,11 @@ def main_loop(server_url: str, videos_dir: Path, mode: Literal['local', 'colab']
                 ok = upload_results_base64_batched(server_url, video_id, WorkerConfig.WORKING_DIR)
                 if not ok:
                     logging.error("Upload Base64 thất bại. Thử phương án ZIP (fallback).")
-                    # Fallback: ZIP
                     zip_path = create_flat_zip_for_server(WorkerConfig.WORKING_DIR, video_id, WorkerConfig.WORKING_DIR)
                     if zip_path:
-                        upload_zip_to_server(server_url, video_id, zip_path)
-
+                        ok = upload_zip_to_server(server_url, video_id, zip_path)  # <<< GÁN LẠI ok
+                if ok:
+                    report_completion_to_server(server_url, video_id)
             logging.info(f"Xử lý '{video_id}' xong trong {time.time() - start:.2f}s")
 
         except Exception as e:
@@ -335,7 +346,18 @@ def main_loop(server_url: str, videos_dir: Path, mode: Literal['local', 'colab']
                     shutil.rmtree(temp_task_dir, ignore_errors=True)
                 except Exception:
                     pass
+
+            # Giải phóng VRAM/RAM (nếu dùng CUDA)
+            try:
+                import torch, gc
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                gc.collect()
+            except Exception:
+                pass
+
             time.sleep(2)
+
 
 
 # ===== 7) Entry =====
