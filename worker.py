@@ -12,7 +12,7 @@ import requests
 
 # ===== 0) Import extractor =====
 try:
-    from infer_concurent_pytorch import VideoKeyframeExtractor
+    from infer_colab import VideoKeyframeExtractor
 except ImportError as e:
     logging.error("Không thể import VideoKeyframeExtractor từ infer_concurent_pytorch.py.")
     raise e
