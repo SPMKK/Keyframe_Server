@@ -13,6 +13,8 @@ scipy
 pillow
 openai
 transformers
+m3u8
+pydub
 aiohttp
 mistralai
 requests
