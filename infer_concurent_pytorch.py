@@ -47,13 +47,21 @@ API_KEY_MISTRAL = MistralApiKeyManager(
     sheet_url=MISTRAL_SHEET_URL
 ).get_active_key_count()
 OCR_PROMPT = '''
-Perform OCR on the provided image. Return only the text detected in the image as a single continuous string with words separated by exactly one space. Do not insert line breaks, punctuation, or extra commentary.
+Step 1: Perform OCR on the provided image. Extract all visible characters exactly as they appear, even if they are small, low-contrast, partially occluded, distorted, or angled.  
+- Prioritize text from signboards, banners, posters, or other high-importance areas.  
+- For each character, use only what is clearly visible—do NOT guess or reconstruct missing parts.  
+- Preserve the original spatial reading order: top-to-bottom, left-to-right.  
+- Return the raw text as a single continuous string with words separated by exactly one space.  
+- Do not insert line breaks, punctuation, or extra commentary.
 
-- Accurately extract all visible characters, even if they are small, low-contrast, partially occluded, distorted, or angled.  
-- Prioritize detecting text from signboards, banners, posters, or other high-importance areas.  
-- For each character, use only what is clearly visible - DO NOT guess or reconstruct missing parts.  
-- Preserve the original order of words as they appear spatially from top-to-bottom and left-to-right.    
-- If no readable text is present, return empty double quotes (`""`).
+Step 2: Using the OCR output from Step 1, produce a corrected version:  
+- Fix spelling errors, grammar issues, and incorrect word forms.  
+- Preserve the meaning and intent of the original text.  
+- Maintain proper Vietnamese diacritics where applicable.  
+- Do not add extra words or rephrase beyond necessary corrections.
+
+Final Output Format:  
+{"raw_text": "<raw OCR text>", "corrected_text": "<corrected version>"}
 '''
 
 class TransNetV2(nn.Module):
@@ -388,7 +396,7 @@ class VideoKeyframeExtractor:
         self.model, self.preprocess = clip.load('ViT-B/32', self.device)
         self.ram = RAM.load_tag_model()
         self.ocr_model = Generator(
-            base_url= 'http://0.0.0.0:9600',
+            base_url= base_url,
             api_key=API_KEY
         )
         self.output_dir = output_dir
@@ -559,13 +567,14 @@ class VideoKeyframeExtractor:
                     try:
                         # Giữ nguyên ảnh, KHÔNG crop
                         response_str, _ = ocr_model.generate(
-                            model_name="gemini-2.5-flash-lite",
+                            model_name="gemini-2.0-flash",
                             images=[img],          # gửi 1 ảnh/lần
                             prompt=OCR_PROMPT,
                             temperature=0.0,
                         )
-
-                        ocr_results[i] = response_str or ""
+                        response_json = self._extract_json_from_response(response_str)
+                        valid_text = response_json.get("corrected_text", "")
+                        ocr_results[i] = valid_text or ""
 
                     except Exception as ee:
                         print(f"[WARNING] OCR failed for index {i}: {ee}")
