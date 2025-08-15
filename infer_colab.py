@@ -544,7 +544,7 @@ class VideoKeyframeExtractor:
 
         similarity_matrix = np.dot(keyframe_features, keyframe_features.T)
         to_keep = list(range(n_keyframes))
-        threshold = 0.94
+        threshold = 0.95
         i = 0
         while i < len(to_keep):
             j = i + 1
