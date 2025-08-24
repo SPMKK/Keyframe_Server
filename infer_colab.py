@@ -30,12 +30,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as functional
 import random
+import subprocess
+import tempfile
+import shlex
+
 
 # (All class definitions like TransNetV2 and other helper methods remain the same)
 # ... [TransNetV2 class and other methods from previous answer go here] ...
 # NOTE: To keep the answer focused, I am omitting the unchanged code.
 # Assume the TransNetV2 class and helper methods from the previous answer are present.
-OCR_BATCH_SIZE = 6
+OCR_BATCH_SIZE = 4
 MISTRAL_SHEET_URL = os.getenv("MISTRAL_SHEET_URL", "https://docs.google.com/spreadsheets/d/1NAlj7OiD9apH3U47RLJK0en1wLSW78X5zqmf6NmVUA4/export?format=csv&gid=0")
 GEMINI_SHEET_URL = os.getenv("GEMINI_SHEET_URL", "https://docs.google.com/spreadsheets/d/1gqlLToS3OXPA-CvfgXRnZ1A6n32eXMTkXz4ghqZxe2I/export?format=csv&gid=0")
 
@@ -413,6 +417,59 @@ class VideoKeyframeExtractor:
         self._counter_lock = threading.Lock()
         # THÊM KHÓA GPU NÀY:
         self._gpu_lock = threading.Lock()
+
+
+#-------------------------
+    @staticmethod
+    def _probe_vcodec(path: str) -> str:
+        """Trả về codec video đầu tiên (vd: 'av1', 'h264', 'hevc', ...)"""
+        try:
+            out = subprocess.check_output([
+                "ffprobe", "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=codec_name",
+                "-of", "json", path
+            ], stderr=subprocess.STDOUT)
+            info = json.loads(out.decode("utf-8", errors="ignore"))
+            return (info.get("streams") or [{}])[0].get("codec_name", "") or ""
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _make_decode_friendly_copy(src_path: str, dst_path: str) -> None:
+        """
+        - Nếu video là AV1 -> transcode sang H.264 yuv420p (CFR).
+        - Ngược lại -> thử copy stream; nếu fail -> fallback transcode H.264.
+        """
+        codec = VideoKeyframeExtractor._probe_vcodec(src_path)  # hoặc self._probe_vcodec(src_path)
+        if codec.lower() == "av1":
+            cmd = [
+                "ffmpeg", "-y", "-i", src_path,
+                "-map", "0:v:0", "-an",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+                "-pix_fmt", "yuv420p", "-vsync", "cfr", "-g", "48",
+                "-movflags", "+faststart",
+                dst_path
+            ]
+            subprocess.run(cmd, check=True)
+            return
+
+        # thử copy nhanh nếu không phải AV1
+        try:
+            cmd = ["ffmpeg", "-y", "-i", src_path, "-c", "copy", dst_path]
+            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except subprocess.CalledProcessError:
+            # fallback: transcode H.264
+            cmd = [
+                "ffmpeg", "-y", "-i", src_path,
+                "-map", "0:v:0", "-an",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+                "-pix_fmt", "yuv420p", "-vsync", "cfr", "-g", "48",
+                "-movflags", "+faststart",
+                dst_path
+            ]
+            subprocess.run(cmd, check=True)
+
+#----------------------------
     
     def _read_frames_by_abs_indices(self, video_path: str, abs_indices: List[int], for_clip: bool=True) -> List[np.ndarray]:
         cap = cv2.VideoCapture(video_path)
@@ -479,7 +536,7 @@ class VideoKeyframeExtractor:
 
     def extract_clip_features(self, frames: List[np.ndarray], shot_id: int = None) -> np.ndarray:
         features = []
-        batch_size = 16
+        batch_size = 4
         progress_prefix = f"[CLIP][Shot {shot_id}]" if shot_id is not None else "[CLIP]"
 
         # Đảm bảo chỉ MỘT luồng truy cập GPU tại một thời điểm
@@ -544,7 +601,7 @@ class VideoKeyframeExtractor:
 
         similarity_matrix = np.dot(keyframe_features, keyframe_features.T)
         to_keep = list(range(n_keyframes))
-        threshold = 0.93
+        threshold = 0.94
         i = 0
         while i < len(to_keep):
             j = i + 1
@@ -787,9 +844,16 @@ class VideoKeyframeExtractor:
                 raise ModuleNotFoundError("`ffmpeg-python` is required. Please run `pip install ffmpeg-python`")
 
             print(f"[TransNetV2-PyTorch] Extracting frames from {video_fn}")
-            video_stream, _ = ffmpeg.input(video_fn).output(
-                "pipe:", format="rawvideo", pix_fmt="rgb24", s="48x27"
-            ).run(capture_stdout=True, capture_stderr=True)
+            
+            # video_stream, _ = ffmpeg.input(video_fn).output(
+            # thêm global args để ẩn banner và bỏ qua lỗi nhẹ
+            stream = (
+                ffmpeg
+                .input(video_fn)
+                .output("pipe:", format="rawvideo", pix_fmt="rgb24", s="48x27", vsync="cfr")
+                .global_args("-hide_banner", "-loglevel", "warning", "-err_detect", "ignore_err")
+            )
+            video_stream, _ = stream.run(capture_stdout=True, capture_stderr=True)
 
             video_frames = np.frombuffer(video_stream, np.uint8).reshape([-1, 27, 48, 3])
             
@@ -897,205 +961,194 @@ class VideoKeyframeExtractor:
                     "ocr": ocr_text,
                     "caption": caption
                 }
-    # <<< MAIN METHOD REFACTORED FOR STREAMING PIPELINE >>>
+    # <<< PHƯƠNG THỨC CHÍNH ĐÃ ĐƯỢC CẬP NHẬT HOÀN CHỈNH >>>
     def extract_keyframes(self, video_path: str, dest_name: str = None) -> None:
-        # ... (các phần code khác không đổi) ...
-
-        # Reset frame counter   for each new video
-        self._frame_counter = 1
-        original_video_name = os.path.splitext(os.path.basename(video_path))[0]
-        final_name = dest_name or original_video_name
-
-        video_output_dir = os.path.join(self.output_dir, final_name)
-        if os.path.exists(video_output_dir):
-            shutil.rmtree(video_output_dir)
-        os.makedirs(video_output_dir, exist_ok=True)
-        
-        # if os.path.exists(video_output_dir): shutil.rmtree(video_output_dir)
-        # os.makedirs(video_output_dir, exist_ok=True)
-
-        # new_video_path = os.path.join(video_output_dir, os.path.basename(video_path))
-        # shutil.copy(video_path, new_video_path)
-        # video_path = new_video_path
-        print(f"\n[PIPELINE] Starting processing for: {video_path}")
-
-        # --- STAGE 1 (Sequential): Shot Detection and Frame Extraction ---
-        fps = self.get_video_fps(video_path)
-        _, single_frame_predictions, all_frame_predictions = self._predict_video_pytorch(video_path)
-        scenes = self.predictions_to_scenes(single_frame_predictions, threshold=0.3)
-
-        print(f"[PIPELINE] Detected {len(scenes)} shots.")
-        print("[PIPELINE] Preparing sampled frame indices (no preloading)...")
-        cap = cv2.VideoCapture(video_path)
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        cap.release()
-        all_frame_indices = list(range(0, total_frames, self.sample_rate))
-        print(f"[PIPELINE] Total={total_frames}, sampled={len(all_frame_indices)}")
-
-        # LOAD RAM MODEL HERE, BEFORE ANY THREADS MIGHT NEED IT FOR POST-PROCESSING
-        # (Đây là một sửa lỗi logic trong code ban đầu của bạn,
-        # vì tag_model cần được tải trước khi các task post-processing được submit)
-        # <<< THAY ĐỔI >>>: Tải các model (giống như trước)
-    # <<< CẢI THIỆN >>>: Sử dụng model đã được tải trong __init__ một cách nhất quán
-        tag_model = self.ram
-        ocr_model = None
+        """
+        Trích xuất keyframe từ video bằng cách sử dụng một pipeline xử lý streaming.
+        Phương thức này tự động tạo một bản sao video tạm thời để tránh lỗi "mmco unref"
+        và đảm bảo file gốc không bị ảnh hưởng.
+        """
+        temp_video_path = None  # Khởi tạo biến cho đường dẫn video tạm thời
         try:
-            # tag_model đã được tải
-            print("[PIPELINE] RAM tag model is already loaded.")
-        except Exception as e:
-            print(f"[ERROR] RAM tag model check failed: {e}. Post-processing will skip tagging.")
-            tag_model = None # Đảm bảo model là None nếu có lỗi
-        try:
+            # --- BƯỚC MỚI: Tạo file video tạm thời để tránh lỗi "mmco unref" ---
+            # Tạo một file tạm thời có tên và giữ lại đuôi .mp4
+            with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as temp_f:
+                temp_video_path = temp_f.name
+            
+            print(f"[PIPELINE] Đang tạo bản sao video tạm thời tại: {temp_video_path}")
+            self._make_decode_friendly_copy(video_path, temp_video_path)
+            print("[PIPELINE] Bản sao tạm đã sẵn sàng (decode-friendly).")
+            # Xây dựng và chạy lệnh ffmpeg để sao chép stream video (rất nhanh)
+            command = [
+                'ffmpeg',
+                '-i', video_path,
+                '-c', 'copy',      # Chỉ sao chép stream, không mã hóa lại
+                '-y',              # Ghi đè file đầu ra nếu đã tồn tại
+                temp_video_path
+            ]
+            
+            # Thực thi lệnh, ẩn output của ffmpeg để log gọn gàng hơn
+            subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            print("[PIPELINE] Đã tạo thành công bản sao tạm thời.")
+
+            # --- Từ đây trở đi, tất cả các thao tác sẽ sử dụng 'temp_video_path' ---
+
+            # Reset bộ đếm frame cho mỗi video mới
+            self._frame_counter = 1
+            original_video_name = os.path.splitext(os.path.basename(video_path))[0]
+            final_name = dest_name or original_video_name
+
+            video_output_dir = os.path.join(self.output_dir, final_name)
+            if os.path.exists(video_output_dir):
+                shutil.rmtree(video_output_dir)
+            os.makedirs(video_output_dir, exist_ok=True)
+            
+            print(f"\n[PIPELINE] Bắt đầu xử lý cho video gốc: {video_path}")
+
+            # --- GIAI ĐOẠN 1 (Tuần tự): Phát hiện Shot và Trích xuất Frame ---
+            # THAY ĐỔI: Sử dụng video tạm thời
+            fps = self.get_video_fps(temp_video_path)
+            _, single_frame_predictions, all_frame_predictions = self._predict_video_pytorch(temp_video_path)
+            scenes = self.predictions_to_scenes(single_frame_predictions, threshold=0.3)
+
+            print(f"[PIPELINE] Phát hiện được {len(scenes)} shot.")
+            print("[PIPELINE] Chuẩn bị chỉ số các frame được lấy mẫu (không tải trước)...")
+            # THAY ĐỔI: Sử dụng video tạm thời
+            cap = cv2.VideoCapture(temp_video_path)
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            cap.release()
+            all_frame_indices = list(range(0, total_frames, self.sample_rate))
+            print(f"[PIPELINE] Tổng số frame={total_frames}, số frame lấy mẫu={len(all_frame_indices)}")
+
+            # Tải các model cần thiết
+            tag_model = self.ram
             ocr_model = self.ocr_model
-            print("[PIPELINE] OCR model initialized successfully.")
-        except Exception as e:
-            print(f"[ERROR] Could not initialize OCR model: {e}. Post-processing will skip OCR.")
-        try:
-            caption_model = None
-            print("[PIPELINE] Caption model initialized successfully.")
-        except Exception as e:
-            print(f"[ERROR] Could not initialize Caption model: {e}. Post-processing will skip captioning.")
-        
-        all_keyframes_info = []
-        metadata_stubs = {}
-        metadata = {final_name: {}}
-        num_cpu_workers = min(4, os.cpu_count() or 1) 
-        print(f"[PIPELINE] Using {num_cpu_workers} workers for shot processing (CPU/GPU overlap).")
+            caption_model = None # Tạm thời vô hiệu hóa caption model nếu bạn chưa dùng
+            
+            all_keyframes_info = []
+            metadata_stubs = {}
+            metadata = {final_name: {}}
+            num_cpu_workers = min(4, os.cpu_count() or 1) 
+            print(f"[PIPELINE] Sử dụng {num_cpu_workers} worker để xử lý shot (CPU/GPU song song).")
 
-        with ThreadPoolExecutor(max_workers=num_cpu_workers, thread_name_prefix='ShotProc') as shot_executor, \
-             ThreadPoolExecutor(max_workers=12, thread_name_prefix='PostProc') as post_proc_executor:
+            with ThreadPoolExecutor(max_workers=num_cpu_workers, thread_name_prefix='ShotProc') as shot_executor, \
+                 ThreadPoolExecutor(max_workers=12, thread_name_prefix='PostProc') as post_proc_executor:
 
-            shot_futures = {
-                shot_executor.submit(
-                    self._process_shot_concurrently,
-                    (shot_idx, scene, all_frame_indices, video_path) 
-                ): shot_idx
-                for shot_idx, scene in enumerate(scenes)
-            }
-            post_processing_futures = []
-            keyframe_batch_buffer = []
+                shot_futures = {
+                    shot_executor.submit(
+                        self._process_shot_concurrently,
+                        # THAY ĐỔI: Truyền đường dẫn video tạm thời vào worker
+                        (shot_idx, scene, all_frame_indices, temp_video_path) 
+                    ): shot_idx
+                    for shot_idx, scene in enumerate(scenes)
+                }
+                post_processing_futures = []
+                keyframe_batch_buffer = []
 
-            print(f"\n[PIPELINE] Submitted {len(shot_futures)} shots for sequential processing. Starting streaming pipeline...")
+                print(f"\n[PIPELINE] Đã gửi {len(shot_futures)} shot để xử lý. Bắt đầu pipeline streaming...")
 
-            for future in as_completed(shot_futures):
-                shot_idx = shot_futures[future]
-                try:
-                    # _process_shot_concurrently giờ trả về:
-                    #   s_idx, keyframe_pos_in_rel, abs_indices
-                    # trong đó abs_indices là danh sách index tuyệt đối trong video
-                    s_idx, keyframe_pos_in_shot, abs_indices = future.result()
-                    if not keyframe_pos_in_shot:
-                        continue
+                for future in as_completed(shot_futures):
+                    shot_idx = shot_futures[future]
+                    try:
+                        s_idx, keyframe_pos_in_shot, abs_indices = future.result()
+                        if not keyframe_pos_in_shot:
+                            continue
 
-                    print(f"[PIPELINE] Shot {s_idx+1} completed. Found {len(keyframe_pos_in_shot)} keyframes. Buffering for post-processing...")
+                        print(f"[PIPELINE] Shot {s_idx+1} hoàn thành. Tìm thấy {len(keyframe_pos_in_shot)} keyframe. Đưa vào buffer hậu xử lý...")
 
-                    for i, pos_in_rel in enumerate(keyframe_pos_in_shot):
-                        # Lấy frame index tuyệt đối trong video
-                        original_frame_idx = abs_indices[pos_in_rel]
+                        for i, pos_in_rel in enumerate(keyframe_pos_in_shot):
+                            original_frame_idx = abs_indices[pos_in_rel]
+                            frame_count = self._get_next_frame_count()
+                            frame_filename = f"frame_{frame_count:03d}.webp"
+                            keyframe_path = os.path.join(video_output_dir, frame_filename)
 
-                        # Cấp số thứ tự file
-                        frame_count = self._get_next_frame_count()
-                        frame_filename = f"frame_{frame_count:03d}.webp"
-                        keyframe_path = os.path.join(video_output_dir, frame_filename)
+                            # Đọc đúng 1 frame full-res từ video tạm thời để LƯU
+                            fullres = self._read_single_frame_fullres(temp_video_path, original_frame_idx)
+                            image = Image.fromarray(fullres)
 
-                        # Đọc đúng 1 frame full-res để LƯU (không giữ mọi frame trong RAM)
-                        fullres = self._read_single_frame_fullres(video_path, original_frame_idx)
-                        image = Image.fromarray(fullres)
-
-                        # Tạo stub metadata TRƯỚC khi đưa vào buffer
-                        timestamp = f"{(original_frame_idx / fps) // 60:02.0f}:{(original_frame_idx / fps) % 60:06.3f}"
-                        metadata_stubs[keyframe_path] = {
-                            "frame_name": f"frame_{frame_count:03d}",
-                            "id": original_frame_idx,
-                            "time-stamp": timestamp,
-                            "shot": s_idx + 1,
-                        }
-
-                        # Lưu ảnh & đưa vào batch post-proc
-                        image.save(keyframe_path, 'WEBP', quality=90)
-                        keyframe_batch_buffer.append((keyframe_path, image))
-
-                        # Đủ batch thì submit OCR/tagging
-                        if len(keyframe_batch_buffer) >= OCR_BATCH_SIZE:
-                            print(f"[PIPELINE] Submitting a batch of {len(keyframe_batch_buffer)} keyframes for post-processing.")
-                            task_batch = keyframe_batch_buffer
-                            keyframe_batch_buffer = []
-
-                            task_future = post_proc_executor.submit(
-                                self._post_process_batch_concurrently,
-                                task_batch,
-                                tag_model,
-                                ocr_model,
-                                caption_model
-                            )
-                            post_processing_futures.append(task_future)
-
-                        # Ghi info cho summary
-                        all_keyframes_info.append((keyframe_path, s_idx, i, original_frame_idx))
-
-                except Exception as exc:
-                    print(f'[PIPELINE] Shot {shot_idx + 1} generated an exception: {exc}')
-
-            if keyframe_batch_buffer:
-                print(f"[PIPELINE] Submitting the final batch of {len(keyframe_batch_buffer)} keyframes.")
-                task_future = post_proc_executor.submit(
-                    self._post_process_batch_concurrently,
-                    keyframe_batch_buffer, # Submit the final buffer
-                    tag_model,
-                    ocr_model,
-                    caption_model
-                )
-                post_processing_futures.append(task_future)
-
-            # <<< SỬA LỖI >>>: XÓA VÒNG LẶP THỨ HAI. Chỉ giữ lại vòng lặp ĐÚNG này.
-            print(f"\n[PIPELINE] All shots processed. Aggregating results from {len(post_processing_futures)} batches...")
-            for future in as_completed(post_processing_futures):
-                try:
-                    batch_results = future.result()
-                    if not batch_results: continue
-
-                    for keyframe_path, tags, ocr_text, caption in batch_results:
-                        # This check will no longer fail due to the race condition
-                        if keyframe_path in metadata_stubs:
-                            stub = metadata_stubs[keyframe_path]
-                            frame_name = stub.pop("frame_name")
-                            metadata[final_name][frame_name] = {
-                                **stub, 
-                                "tags": tags,
-                                "ocr": ocr_text,
-                                "caption": caption
+                            timestamp = f"{(original_frame_idx / fps) // 60:02.0f}:{(original_frame_idx / fps) % 60:06.3f}"
+                            metadata_stubs[keyframe_path] = {
+                                "frame_name": f"frame_{frame_count:03d}",
+                                "id": original_frame_idx,
+                                "time-stamp": timestamp,
+                                "shot": s_idx + 1,
                             }
-                        else:
-                            # This warning can help debug other potential issues
-                            print(f"[WARNING] Could not find metadata stub for processed keyframe: {keyframe_path}")
-                except Exception as exc:
-                    print(f'[PIPELINE] A post-processing batch generated an exception: {exc}')
-        metadata = self._validate_and_rerun_missing_frames(
-            video_output_dir,
-            metadata,
-            all_keyframes_info,
-            fps,
-            tag_model,
-            ocr_model,
-            caption_model
-        )
-        
-        # --- STAGE 4 (Finalization): Save all files ---
-        # Sort metadata by frame number for consistent output
-        sorted_frames = sorted(metadata[final_name].items(), key=lambda item: int(item[0].split('_')[1]))
-        metadata[final_name] = dict(sorted_frames)
 
-        metadata_path = os.path.join(video_output_dir, "metadata.json")
-        with open(metadata_path, "w", encoding='utf-8') as f:
-            json.dump(metadata, f, indent=3, ensure_ascii=False)
-        print(f"[PIPELINE] Metadata saved to {metadata_path}")
-        
-        # Sort summary info for readability
-        all_keyframes_info.sort(key=lambda x: int(os.path.basename(x[0]).split('_')[1].split('.')[0]))
-        with open(os.path.join(video_output_dir, "keyframes_summary.txt"), "w") as f:
-            f.write(f"Video: {os.path.basename(video_path)}\nTotal shots: {len(scenes)}\nTotal keyframes: {len(all_keyframes_info)}\n\n")
-            for path, s_idx, k_idx, o_idx in all_keyframes_info:
-                f.write(f"{os.path.basename(path)}: Shot {s_idx+1}, Keyframe {k_idx+1}, Original Frame {o_idx}\n")
+                            image.save(keyframe_path, 'WEBP', quality=90)
+                            keyframe_batch_buffer.append((keyframe_path, image))
+
+                            if len(keyframe_batch_buffer) >= OCR_BATCH_SIZE:
+                                print(f"[PIPELINE] Gửi một batch gồm {len(keyframe_batch_buffer)} keyframe để hậu xử lý.")
+                                task_batch = keyframe_batch_buffer
+                                keyframe_batch_buffer = []
+
+                                task_future = post_proc_executor.submit(
+                                    self._post_process_batch_concurrently,
+                                    task_batch, tag_model, ocr_model, caption_model
+                                )
+                                post_processing_futures.append(task_future)
+
+                            all_keyframes_info.append((keyframe_path, s_idx, i, original_frame_idx))
+
+                    except Exception as exc:
+                        print(f'[PIPELINE] Shot {shot_idx + 1} đã xảy ra lỗi: {exc}')
+
+                if keyframe_batch_buffer:
+                    print(f"[PIPELINE] Gửi batch cuối cùng gồm {len(keyframe_batch_buffer)} keyframe.")
+                    task_future = post_proc_executor.submit(
+                        self._post_process_batch_concurrently,
+                        keyframe_batch_buffer, tag_model, ocr_model, caption_model
+                    )
+                    post_processing_futures.append(task_future)
+
+                print(f"\n[PIPELINE] Tất cả các shot đã xử lý. Tổng hợp kết quả từ {len(post_processing_futures)} batch...")
+                for future in as_completed(post_processing_futures):
+                    try:
+                        batch_results = future.result()
+                        if not batch_results: continue
+
+                        for keyframe_path, tags, ocr_text, caption in batch_results:
+                            if keyframe_path in metadata_stubs:
+                                stub = metadata_stubs[keyframe_path]
+                                frame_name = stub.pop("frame_name")
+                                metadata[final_name][frame_name] = {
+                                    **stub, 
+                                    "tags": tags,
+                                    "ocr": ocr_text,
+                                    "caption": caption
+                                }
+                            else:
+                                print(f"[CẢNH BÁO] Không tìm thấy metadata stub cho keyframe đã xử lý: {keyframe_path}")
+                    except Exception as exc:
+                        print(f'[PIPELINE] Một batch hậu xử lý đã xảy ra lỗi: {exc}')
+            
+            # --- GIAI ĐOẠN 3 (Xác thực): Kiểm tra và chạy lại các frame bị thiếu ---
+            metadata = self._validate_and_rerun_missing_frames(
+                video_output_dir, metadata, all_keyframes_info, fps,
+                tag_model, ocr_model, caption_model
+            )
+            
+            # --- GIAI ĐOẠN 4 (Hoàn tất): Lưu tất cả các file ---
+            sorted_frames = sorted(metadata[final_name].items(), key=lambda item: int(item[0].split('_')[1]))
+            metadata[final_name] = dict(sorted_frames)
+
+            metadata_path = os.path.join(video_output_dir, "metadata.json")
+            with open(metadata_path, "w", encoding='utf-8') as f:
+                json.dump(metadata, f, indent=3, ensure_ascii=False)
+            print(f"[PIPELINE] Metadata đã được lưu vào {metadata_path}")
+            
+            all_keyframes_info.sort(key=lambda x: int(os.path.basename(x[0]).split('_')[1].split('.')[0]))
+            with open(os.path.join(video_output_dir, "keyframes_summary.txt"), "w") as f:
+                f.write(f"Video: {os.path.basename(video_path)}\nTotal shots: {len(scenes)}\nTotal keyframes: {len(all_keyframes_info)}\n\n")
+                for path, s_idx, k_idx, o_idx in all_keyframes_info:
+                    f.write(f"{os.path.basename(path)}: Shot {s_idx+1}, Keyframe {k_idx+1}, Original Frame {o_idx}\n")
+
+        finally:
+            # --- BƯỚC MỚI: Dọn dẹp file video tạm thời ---
+            # Khối này đảm bảo file tạm thời luôn được xóa, ngay cả khi có lỗi xảy ra
+            if temp_video_path and os.path.exists(temp_video_path):
+                print(f"[PIPELINE] Đang xóa file video tạm thời: {temp_video_path}")
+                os.remove(temp_video_path)
 
 
 
