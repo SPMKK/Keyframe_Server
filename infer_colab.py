@@ -31,12 +31,11 @@ import torch.nn as nn
 import torch.nn.functional as functional
 import random
 
-
 # (All class definitions like TransNetV2 and other helper methods remain the same)
 # ... [TransNetV2 class and other methods from previous answer go here] ...
 # NOTE: To keep the answer focused, I am omitting the unchanged code.
 # Assume the TransNetV2 class and helper methods from the previous answer are present.
-OCR_BATCH_SIZE = 4
+OCR_BATCH_SIZE = 6
 MISTRAL_SHEET_URL = os.getenv("MISTRAL_SHEET_URL", "https://docs.google.com/spreadsheets/d/1NAlj7OiD9apH3U47RLJK0en1wLSW78X5zqmf6NmVUA4/export?format=csv&gid=0")
 GEMINI_SHEET_URL = os.getenv("GEMINI_SHEET_URL", "https://docs.google.com/spreadsheets/d/1gqlLToS3OXPA-CvfgXRnZ1A6n32eXMTkXz4ghqZxe2I/export?format=csv&gid=0")
 
@@ -480,7 +479,7 @@ class VideoKeyframeExtractor:
 
     def extract_clip_features(self, frames: List[np.ndarray], shot_id: int = None) -> np.ndarray:
         features = []
-        batch_size = 4
+        batch_size = 16
         progress_prefix = f"[CLIP][Shot {shot_id}]" if shot_id is not None else "[CLIP]"
 
         # Đảm bảo chỉ MỘT luồng truy cập GPU tại một thời điểm
@@ -545,7 +544,7 @@ class VideoKeyframeExtractor:
 
         similarity_matrix = np.dot(keyframe_features, keyframe_features.T)
         to_keep = list(range(n_keyframes))
-        threshold = 0.94
+        threshold = 0.95
         i = 0
         while i < len(to_keep):
             j = i + 1
