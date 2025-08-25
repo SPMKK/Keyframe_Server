@@ -1659,8 +1659,8 @@ class VideoKeyframeExtractor:
         metadata_stubs = {}
         metadata = {video_name: {}}
         
-        num_cpu_workers = min(8, os.cpu_count() or 1) 
-        num_post_proc_workers = 12 # Can be higher for network-bound tasks
+        num_cpu_workers = min(4, os.cpu_count() or 1) 
+        num_post_proc_workers = 4 # Can be higher for network-bound tasks
         print(f"[PIPELINE] Using {num_cpu_workers} producer workers and {num_post_proc_workers} consumer workers.")
 
         # --- STAGE 2 & 3 (Parallel): Streaming Producer-Consumer Pipeline on RAM buffer ---
@@ -1893,7 +1893,7 @@ def main():
     p_ext = subparsers.add_parser("extract", help="Run full keyframe extraction pipeline")
     p_ext.add_argument("video_path", type=str, help="Path to the video file or directory of videos")
     p_ext.add_argument("--output", type=str, default="keyframes", help="Output directory for keyframes")
-    p_ext.add_argument("--sample-rate", type=int, default=3, help="Sample every N frames to reduce computation")
+    p_ext.add_argument("--sample-rate", type=int, default=4, help="Sample every N frames to reduce computation")
     p_ext.add_argument("--max-frames", type=int, default=55, help="Maximum number of frames to process per shot")
 
     # nếu muốn giữ tương thích cũ (không ghi 'extract'), map về extract:
