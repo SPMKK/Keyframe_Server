@@ -29,7 +29,8 @@ import functools
 import mimetypes
 import unicodedata
 from pydub.silence import split_on_silence
-# from io import BytesIO
+from pydub.silence import detect_nonsilent
+from io import BytesIO
 def remove_vietnamese_tones(text):
     # Normalize Unicode (NFD = tách ký tự và dấu)
     text = unicodedata.normalize('NFD', text)
@@ -37,6 +38,135 @@ def remove_vietnamese_tones(text):
     text = ''.join([c for c in text if not unicodedata.combining(c)])
     # Convert về dạng chuẩn NFC nếu cần (tùy use-case)
     return text
+def _format_time(seconds: float) -> str:
+    """Formats seconds into HH:MM:SS string."""
+    seconds = int(seconds)
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+def _wav_bytes_per_sec(sr: int = 16000, ch: int = 1, bits: int = 16) -> int:
+    return int(sr * ch * (bits // 8))
+
+def _sec_from_mb_pcm(max_chunk_mb: float, bytes_per_sec: int, safety: float = 0.9) -> float:
+    # Ước lượng thời lượng theo băng thông PCM (chuẩn hóa về 16k/mono/16-bit trước khi nén FLAC)
+    return (max_chunk_mb * 1024 * 1024 * safety) / bytes_per_sec
+
+def _export_flac_to_bytes(seg, name: str):
+    buf = BytesIO()
+    # pydub/ffmpeg sẽ nén FLAC lossless
+    seg.export(buf, format="flac")
+    return {"bytes": buf.getvalue(), "name": name}
+def _parse_time_key_to_seconds(time_key: str) -> Tuple[float, float]:
+    """
+    Parses a 'HH:MM:SS-HH:MM:SS' string back into a tuple of (start_sec, end_sec).
+    Returns (0.0, 0.0) on failure.
+    """
+    try:
+        start_str, end_str = time_key.split('-')
+        s_h, s_m, s_s = map(int, start_str.split(':'))
+        e_h, e_m, e_s = map(int, end_str.split(':'))
+        start_sec = float(s_h * 3600 + s_m * 60 + s_s)
+        end_sec = float(e_h * 3600 + e_m * 60 + e_s)
+        return start_sec, end_sec
+    except Exception:
+        return 0.0, 0.0
+    
+def chunk_audio_for_gemini_fast_flac(
+    audio_path: str,
+    max_chunk_mb: float = 18,
+    min_chunk_sec: float = 1.0,
+    min_loudness_dbfs: float = -50.0,
+    min_silence_len_ms: int = 700,
+    keep_silence_ms: int = 300,
+    join_gap_ms: int = 250,
+    target_sr: int = 16000,
+    target_channels: int = 1,
+    target_bits: int = 16,
+    parallel_exports: int = 8
+):
+    """
+    Chunk nhanh cho transcription:
+    - Chuẩn hóa audio về mono/16k/16-bit (chuẩn tốt cho ASR)
+    - Gom non-silent theo thời lượng mục tiêu suy ra từ giới hạn MB *trên PCM*
+    - Chỉ export 1 lần/ chunk sang FLAC (lossless)
+    """
+    audio = AudioSegment.from_file(audio_path)
+    audio = audio.set_channels(target_channels).set_frame_rate(target_sr).set_sample_width(target_bits // 8)
+
+    non_silent_ranges = detect_nonsilent(
+        audio,
+        min_silence_len=min_silence_len_ms,
+        silence_thresh=audio.dBFS - 14,
+        seek_step=1
+    )
+    if not non_silent_ranges:
+        print("[INFO] No speech detected.")
+        return []
+
+    # Merge các khoảng gần nhau và thêm đệm
+    merged = []
+    cur_start, cur_end = non_silent_ranges[0]
+    for s, e in non_silent_ranges[1:]:
+        if s - cur_end <= join_gap_ms:
+            cur_end = e
+        else:
+            merged.append([max(0, cur_start - keep_silence_ms), min(len(audio), cur_end + keep_silence_ms)])
+            cur_start, cur_end = s, e
+    merged.append([max(0, cur_start - keep_silence_ms), min(len(audio), cur_end + keep_silence_ms)])
+
+    # Tính thời lượng mục tiêu dựa trên băng thông PCM chuẩn hóa
+    bps = _wav_bytes_per_sec(sr=target_sr, ch=target_channels, bits=target_bits)
+    target_sec = _sec_from_mb_pcm(max_chunk_mb, bps, safety=0.9)
+    target_ms = int(target_sec * 1000)
+
+    # Gom interval -> chunk theo target_ms
+    chunks = []
+    cur_chunk_start = None
+    cur_chunk_end = None
+    acc_ms = 0
+
+    def flush_chunk(a_start, a_end):
+        seg = audio[a_start:a_end]
+        if len(seg) < int(min_chunk_sec * 1000):
+            return None
+        if seg.dBFS < min_loudness_dbfs:
+            return None
+        return seg
+
+    for s, e in merged:
+        seg_len = e - s
+        if cur_chunk_start is None:
+            cur_chunk_start, cur_chunk_end, acc_ms = s, e, seg_len
+        else:
+            if acc_ms + seg_len <= target_ms:
+                cur_chunk_end = e
+                acc_ms += seg_len
+            else:
+                seg = flush_chunk(cur_chunk_start, cur_chunk_end)
+                if seg:
+                    chunks.append(seg)
+                cur_chunk_start, cur_chunk_end, acc_ms = s, e, seg_len
+
+    seg = flush_chunk(cur_chunk_start, cur_chunk_end)
+    if seg:
+        chunks.append(seg)
+
+    if not chunks:
+        print("[INFO] No valid chunks after filtering.")
+        return []
+
+    # Export FLAC song song
+    results = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=parallel_exports) as ex:
+        futs = [ex.submit(_export_flac_to_bytes, seg, f"chunk_{i}.flac") for i, seg in enumerate(chunks, 1)]
+        for f in concurrent.futures.as_completed(futs):
+            results.append(f.result())
+
+    results.sort(key=lambda x: int(x["name"].split("_")[1].split(".")[0]))
+    print(f"[INFO] Final: {len(results)} safe FLAC chunks for Gemini.")
+    return results
+
 class Generator:
     """
     An optimized, universal client for the Unified AI Gateway server.
@@ -49,7 +179,7 @@ class Generator:
                  model_name: str = "mistral-medium-latest",
                  temperature: float = 0.7,
                  max_new_tokens: int = 4096,
-                 timeout: int = 120):
+                 timeout: int = 900):
         """
         Initialize the Generator for the Unified AI Gateway.
 
@@ -316,115 +446,75 @@ class Generator:
         except Exception as e:
             raise IOError(f"Failed to process M3U8 playlist '{file_path}': {e}") from e
 
-    def chunk_audio_for_gemini(
-        self,
-        audio_path,
-        max_chunk_mb=18,          # Keep a bit below 20 MB inline limit
-        min_chunk_sec=1.0,        # Skip anything shorter than 1 sec
-        min_loudness_dbfs=-50     # Skip chunks quieter than this
-    ):
+    def _chunk_audio_by_time(self, audio: AudioSegment, chunk_duration_sec: int) -> List[Dict[str, Any]]:
         """
-        Split audio into safe chunks for Gemini API.
-        Returns a list of dicts: [{"bytes": ..., "name": "chunk_x.mp3"}]
+        MODIFIED: Slices an audio segment into fixed-duration chunks WITH an overlap.
+        It stores both the actual audio segment and its logical, non-overlapping time range.
         """
-        audio = AudioSegment.from_file(audio_path)
-        processed_chunks = []
+        overlap_ms = int(5.0 * 1000)
+        chunk_duration_ms = int(chunk_duration_sec * 1000)
+        
+        print(f"🔪 Slicing audio into {chunk_duration_sec}-second segments with a {5.0}-second overlap...")
+        chunks = []
+        duration_ms = len(audio)
+        
+        # The step is the chunk duration minus the overlap
+        step = chunk_duration_ms - overlap_ms
+        
+        for i in range(0, duration_ms, step):
+            # Define the logical, non-overlapping boundaries for this chunk
+            logical_start_ms = i
+            logical_end_ms = min(i + chunk_duration_ms, duration_ms)
 
-        # 1. Split on silence
-        speech_segments = split_on_silence(
-            audio,
-            min_silence_len=700,                   # 0.7 seconds
-            silence_thresh=audio.dBFS - 14,        # 14 dB below avg
-            keep_silence=300                       # 0.3 sec padding
-        )
+            # Define the actual slice boundaries, adding the overlap to the end
+            actual_end_ms = min(logical_end_ms + overlap_ms, duration_ms)
+            
+            # The start of the slice is just the logical start
+            segment = audio[logical_start_ms:actual_end_ms]
 
-        if not speech_segments:
-            print("[INFO] No speech detected.")
-            return []
+            if len(segment) > 500: # Ignore tiny leftover segments
+                chunks.append({
+                    "segment": segment,
+                    "start_sec": logical_start_ms / 1000.0,
+                    "end_sec": logical_end_ms / 1000.0
+                })
+        print(f"✅ Created {len(chunks)} overlapping time-based chunks.")
+        return chunks
 
-        print(f"[INFO] Found {len(speech_segments)} raw segments.")
-
-        # 2. Combine segments into larger chunks under size limit
-        current_chunk = AudioSegment.empty()
-        chunk_index = 1
-
-        def finalize_chunk(ch):
-            """Export chunk to bytes and check size/quality."""
-            buf = BytesIO()
-            ch.export(buf, format="mp3", bitrate="128k")
-            size_mb = len(buf.getvalue()) / (1024 * 1024)
-
-            # Skip empty, too short, or too quiet
-            if size_mb < 0.05:  # 50 KB
-                return None
-            if len(ch) < min_chunk_sec * 1000:
-                return None
-            if ch.dBFS < min_loudness_dbfs:
-                return None
-            if size_mb > max_chunk_mb:
-                print(f"[WARN] A single chunk exceeded {max_chunk_mb} MB after encoding.")
-                return None
-
-            return {
-                "bytes": buf.getvalue(),
-                "name": f"chunk_{chunk_index}.mp3"
-            }
-
-        for seg in speech_segments:
-            # Test if adding seg would exceed limit
-            test_chunk = current_chunk + seg
-            buf = BytesIO()
-            test_chunk.export(buf, format="mp3", bitrate="128k")
-            size_mb = len(buf.getvalue()) / (1024 * 1024)
-
-            if size_mb <= max_chunk_mb:
-                current_chunk = test_chunk
-            else:
-                safe = finalize_chunk(current_chunk)
-                if safe:
-                    processed_chunks.append(safe)
-                    chunk_index += 1
-                current_chunk = seg
-
-        # Add the last chunk
-        safe = finalize_chunk(current_chunk)
-        if safe:
-            processed_chunks.append(safe)
-
-        print(f"[INFO] Final: {len(processed_chunks)} safe chunks for Gemini.")
-        return processed_chunks
     def _transcribe_chunk(self,
-                          # NO session_key
-                          file_bytes: bytes,
-                          file_name: str,
+                          chunk_data: Dict[str, Any],
                           model: str,
                           prompt: Optional[str],
-                          language: Optional[str]) -> str:
-        """A private helper to transcribe a single, stateless chunk."""
+                          language: Optional[str]) -> Tuple[Dict[str, Any], str]:
+        """
+        MODIFIED: Now always returns the chunk_data and either the result or a formatted error string.
+        It no longer raises an exception on its own.
+        """
         transcription_url = f"{self.base_url}/v1/audio/transcriptions"
         
-        # Simple payload, no session key
         data_payload = {'model': model}
         if prompt: data_payload['prompt'] = prompt
         if language: data_payload['language'] = language
         
-        files_payload = {'file': (file_name, file_bytes)}
+        files_payload = {'file': (chunk_data["name"], chunk_data["bytes"])}
         
         try:
             response = requests.post(
-                transcription_url,
-                files=files_payload,
-                data=data_payload,
-                timeout=self.timeout
+                transcription_url, files=files_payload, data=data_payload, timeout=self.timeout
             )
             response.raise_for_status()
             result = response.json()
             if "text" not in result:
-                raise Exception(f"Server returned an unexpected response for chunk {file_name}: {result}")
-            print(f"✅ Transcribed chunk '{file_name}' successfully.")
-            return result["text"]
+                raise Exception(f"Server returned an unexpected JSON response: {result}")
+            
+            print(f"✅ Transcribed chunk '{chunk_data['name']}' ({_format_time(chunk_data['start_sec'])}) successfully.")
+            return (chunk_data, result["text"])
         except Exception as e:
-            raise RuntimeError(f"Failed to transcribe chunk {file_name}") from e
+            error_message = f"Failed to transcribe chunk {chunk_data['name']} due to {type(e).__name__}"
+            print(f"❌ {error_message}")
+            # Return a formatted, recognizable error string instead of raising an exception
+            return (chunk_data, f"[ERROR: {error_message}]")
+
 
     async def transcribe(self,
                          file: Union[str, bytes],
@@ -432,22 +522,34 @@ class Generator:
                          file_name: Optional[str] = "media.dat",
                          prompt: Optional[str] = None,
                          language: Optional[str] = None,
-                         max_chunk_mb: int = 15,
-                         max_concurrent_chunks: int = 10) -> str: # Concurrency limit
+                         chunk_duration_minutes: float = 5.0,
+                         max_concurrent_chunks: int = 10,
+                         # --- NEW PARAMETER FOR TARGETED RETRIES ---
+                         time_ranges_to_process: Optional[List[Tuple[float, float]]] = None
+                        ) -> Dict[str, str]:
         """
-        Transcribes an audio or video file concurrently by splitting large files
-        into smaller chunks and processing them in parallel.
-        
-        NOTE: This is now an ASYNC method and must be called with 'await'.
-        """
-        print(f"🎤 Preparing concurrent transcription request for model '{model}'...")
-        
-        # We need the asyncio loop for running sync code in threads
-        loop = asyncio.get_running_loop()
-        temp_dir = tempfile.mkdtemp()
-        try:
-                        # --- STAGE 1: BEGIN TRANSCRIPTION SESSION AND GET A STICKY KEY ---
+        Transcribes an audio or video file into a timestamped JSON object.
 
+        The file is split into fixed-duration chunks (e.g., 5 minutes), which are
+        processed concurrently for high speed.
+
+        Args:
+            file: File path (str) or file content (bytes).
+            model: The transcription model to use (e.g., "gemini-1.5-pro-latest").
+            file_name: A name for the file if input is bytes.
+            prompt: An optional prompt to guide the transcription model.
+            language: The language of the audio (e.g., "Vietnamese").
+            chunk_duration_minutes: The duration of each chunk in minutes.
+            max_concurrent_chunks: The number of chunks to process in parallel.
+
+        Returns:
+            A dictionary where keys are time ranges ("HH:MM:SS-HH:MM:SS") and
+            values are the transcribed text for that range.
+        """
+        print(f"🎤 Preparing concurrent transcription for model '{model}'...")
+        temp_dir = tempfile.mkdtemp()
+        
+        try:
             input_path_str = None
             if isinstance(file, str):
                 if not Path(file).exists(): raise FileNotFoundError(f"Input file not found: {file}")
@@ -459,71 +561,86 @@ class Generator:
             else:
                 raise TypeError(f"File input must be a file path (str) or bytes, but got {type(file)}")
 
-            standardized_audio_path = input_path_str
-            # --- Stage 3: Prepare chunks for transcription ---
-            # processed_size_bytes = os.path.getsize(standardized_audio_path)
-            processed_size_mb = os.path.getsize(standardized_audio_path) / (1024 * 1024)
-            print(f"✅ Standardized audio size: {processed_size_mb:.2f} MB")
+            # --- STAGE 1: Load and standardize audio ---
+            print("🔊 Standardizing audio to 16kHz mono for optimal transcription...")
+            audio = AudioSegment.from_file(input_path_str)
+            audio = audio.set_channels(1).set_frame_rate(16000).set_sample_width(2)
 
-            chunks_to_process = []
-            if processed_size_mb <= max_chunk_mb:
-                # File is small enough, no chunking needed.
-                with open(standardized_audio_path, 'rb') as f:
-                    file_content = f.read()
-                chunks_to_process.append({ "bytes": file_content, "name": "audio.mp3", "prompt": prompt })
+            # --- STAGE 2: Chunk audio by time duration ---
+            time_based_chunks = []
+            if not time_ranges_to_process:
+                # A) Full file processing
+                print(f"🔪 Slicing entire audio into {chunk_duration_minutes}-minute segments...")
+                chunk_duration_sec = int(chunk_duration_minutes * 60)
+                time_based_chunks = self._chunk_audio_by_time(audio, chunk_duration_sec)
             else:
-                print(f"⚠️ File exceeds {max_chunk_mb} MB. Splitting on silence + recombining...")
-                chunks = self.chunk_audio_for_gemini(
-                    input_path_str,
-                    max_chunk_mb=max_chunk_mb,
-                    min_chunk_sec=1.0,
-                    min_loudness_dbfs=-50.0,
-                )
-                # Fallback prompt for subsequent chunks
-                chunks_to_process = []
-                for i, ch in enumerate(chunks):
-                    chunks_to_process.append({
-                        "bytes": ch["bytes"],
-                        "name": ch["name"],
-                        "prompt": ""
-                    })
+                # B) Targeted range processing for retries
+                print(f"🎯 Processing {len(time_ranges_to_process)} specific time range(s)...")
+                for start_sec, end_sec in time_ranges_to_process:
+                    segment = audio[int(start_sec * 1000):int(end_sec * 1000)]
+                    if len(segment) > 500: # Ignore empty segments
+                        time_based_chunks.append({
+                            "segment": segment,
+                            "start_sec": start_sec,
+                            "end_sec": end_sec
+                        })
 
-            if not chunks_to_process:
-                print("[INFO] No valid chunks to transcribe.")
-                return ""
-            start_time=time.time()
-            # --- Stage 4: Transcribe all chunks concurrently ---
-            full_transcript_parts = []
+            if not time_based_chunks:
+                print("[INFO] No audio chunks to process.")
+                return {}
+
+            # --- STAGE 3: Prepare chunks for concurrent upload (export to FLAC) ---
+            chunks_to_process = []
+            for i, chunk in enumerate(time_based_chunks, 1):
+                flac_data = _export_flac_to_bytes(chunk["segment"], f"chunk_{i}.flac")
+                chunks_to_process.append({
+                    "bytes": flac_data["bytes"],
+                    "name": flac_data["name"],
+                    "start_sec": chunk["start_sec"],
+                    "end_sec": chunk["end_sec"],
+                    "prompt": prompt # Use the same prompt for all chunks
+                })
+            
+            # --- STAGE 4: Transcribe all chunks concurrently ---
+            start_time = time.time()
+            final_transcript = {}
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_concurrent_chunks) as executor:
                 loop = asyncio.get_running_loop()
-                tasks = []
-                for i, chunk_data in enumerate(chunks_to_process):
-                    # The session_key must be passed to the helper
-                    task = loop.run_in_executor(
+                tasks = [
+                    loop.run_in_executor(
                         executor, self._transcribe_chunk,
-                        # session_key, # This was missing in the previous version
-                        chunk_data["bytes"], chunk_data["name"], model,
-                        chunk_data["prompt"], language
-                    )
-                    tasks.append(task)
+                        chunk_data, model, prompt, language
+                    ) for chunk_data in chunks_to_process
+                ]
                 
-                full_transcript_parts = await asyncio.gather(*tasks)
+                # `results` will be a list of tuples: [(chunk_data, text), ...]
+                results = await asyncio.gather(*tasks)
                 end_time = time.time()
-                print(f"✅ All parts transcribed in {end_time - start_time:.2f} seconds.")
-                transcripted_text = " ".join(full_transcript_parts)
-                transcripted_text = remove_vietnamese_tones(transcripted_text)
-            return transcripted_text
-        except Exception as e:
-            # Handle all exceptions from the process
-            print(f"❌ An error occurred during the transcription process.")
-            if isinstance(e, RuntimeError):
-                print(f"   Details: {e}")
-            else:
-                print(f"   Details: {self._handle_api_error(e)}")
-            raise
+                print(f"✅ All {len(results)} parts transcribed in {end_time - start_time:.2f} seconds.")
 
+            # --- STAGE 5: Assemble final timestamped JSON object ---
+            print("📝 Assembling final transcript with timestamps and any errors...")
+            final_transcript = {}
+            for chunk_data, text_or_error in sorted(results, key=lambda item: item[0]['start_sec']):
+                start_str = chunk_data['start_sec']
+                end_str = chunk_data['end_sec']
+                time_key = f"{start_str}-{end_str}"
+                
+                # Check if the result for this chunk is an error string
+                if isinstance(text_or_error, str) and text_or_error.strip().startswith("[ERROR:"):
+                    final_transcript[time_key] = text_or_error
+                else:
+                    # It's a successful transcription, process it
+                    processed_text = text_or_error.strip()
+                    final_transcript[time_key] = processed_text
+
+            return final_transcript
+
+        except Exception as e:
+            # This will only catch critical errors like file not found, not individual chunk errors
+            print(f"❌ A critical error occurred during the transcription pre-processing: {e}")
+            raise
         finally:
-            # The rest of the cleanup happens immediately without waiting for the POST to finish
             if os.path.exists(temp_dir):
                 import shutil
                 shutil.rmtree(temp_dir)
@@ -596,7 +713,100 @@ class Generator:
             error_message = self._handle_api_error(e)
             print(f"❌ OCR failed: {error_message}")
             raise RuntimeError(error_message) from e
+        
+    def process_video(self,
+                      video: Union[str, bytes],
+                      prompt: str,
+                      model_name: str = "gemini-1.5-pro-latest",
+                      file_name: str = "video.mp4",
+                      **kwargs) -> Tuple[str, List[Message]]:
+        """
+        Processes a video with a given prompt using the AI Gateway's dedicated endpoint.
 
+        This method is ideal for analyzing video content, describing scenes, or answering
+        questions about a video.
+
+        Args:
+            video: The video source. Can be a local file path (str), a web URL (str),
+                   or raw video data (bytes).
+            prompt: The text prompt to guide the analysis of the video.
+            model_name: The model to use for processing (e.g., "gemini-1.5-pro-latest").
+            file_name: A name for the file, required if the input is bytes.
+            **kwargs: Additional parameters to pass to the API.
+
+        Returns:
+            A tuple containing the generated text response and a simplified conversation history.
+        """
+        print(f"📹 Preparing to process video for model '{model_name}'...")
+        try:
+            video_bytes: Optional[bytes] = None
+            final_file_name = file_name
+
+            # --- Step 1: Handle different video input types ---
+            if isinstance(video, bytes):
+                video_bytes = video
+                print(f"   -> Processing video from in-memory bytes ({len(video_bytes)/1024**2:.2f} MB).")
+            elif isinstance(video, str):
+                if video.startswith(('http://', 'https://')):
+                    print(f"   -> Downloading video from URL: {video}")
+                    try:
+                        response = requests.get(video, stream=True, timeout=self.timeout)
+                        response.raise_for_status()
+                        video_bytes = response.content
+                        final_file_name = Path(video).name or file_name
+                    except requests.RequestException as e:
+                        raise IOError(f"Failed to download video from URL: {e}") from e
+                else:
+                    video_path = Path(video)
+                    if not video_path.exists():
+                        raise FileNotFoundError(f"Video file not found at: {video_path}")
+                    print(f"   -> Reading video from local path: {video_path}")
+                    with open(video_path, 'rb') as f:
+                        video_bytes = f.read()
+                    final_file_name = video_path.name
+            else:
+                raise TypeError(f"Unsupported video input type: {type(video)}. Must be str (path/URL) or bytes.")
+
+            if not video_bytes:
+                raise ValueError("Video content could not be loaded or is empty.")
+
+            # --- Step 2: Make the API request to the video processing endpoint ---
+            video_processing_url = f"{self.base_url}/v1/video/process"
+            
+            data_payload = {'model': model_name, 'prompt': prompt}
+            data_payload.update(kwargs) # Pass any extra parameters
+
+            files_payload = {'file': (final_file_name, video_bytes, mimetypes.guess_type(final_file_name)[0] or 'video/mp4')}
+
+            print(f"   -> Sending '{final_file_name}' to the gateway. This may take a while...")
+            # Use a significantly longer timeout for video processing
+            response = requests.post(
+                video_processing_url,
+                files=files_payload,
+                data=data_payload,
+                timeout=self.timeout * 5 # 5x default timeout for video
+            )
+            response.raise_for_status()
+
+            result_json = response.json()
+            if "error" in result_json: # Handle server-side errors returned in a 200 OK
+                raise Exception(result_json.get("error", {}).get("message", "Unknown server error"))
+
+            # --- Step 3: Format and return the response ---
+            response_text = result_json.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+
+            conversation_history = [
+                {"role": "user", "content": f"[Video processed: {final_file_name}]\n\n{prompt}"},
+                {"role": "assistant", "content": response_text}
+            ]
+
+            return response_text, conversation_history
+
+        except Exception as e:
+            error_message = self._handle_api_error(e)
+            print(f"❌ Video processing failed: {error_message}")
+            raise RuntimeError(error_message) from e
+        
     def get_server_metrics(self) -> Optional[Dict]:
         """Gets real-time metrics from the gateway's dashboard."""
         try:
