@@ -9,10 +9,10 @@ from typing import Dict, Optional, Literal, List
 import base64
 import zipfile
 import requests
-
+import subprocess
 # ===== 0) Import extractor =====
 try:
-    from infer_concurent_pytorch import VideoKeyframeExtractor
+    from infer_ffmpeg import VideoKeyframeExtractor
 except ImportError as e:
     logging.error("Không thể import VideoKeyframeExtractor từ infer_concurent_pytorch.py.")
     raise e
@@ -275,10 +275,25 @@ def main_loop(server_url: str, videos_dir: Path, mode: Literal['local', 'colab']
         start = time.time()
         zip_path: Optional[Path] = None
         temp_task_dir: Optional[Path] = None
-
+        preprocessed_video_path: Optional[Path] = None
         try:
             logging.info(f"=== Bắt đầu xử lý: {video_id} ===")
-
+            preprocessed_video_path = (WorkerConfig.WORKING_DIR / Path(filename).stem).with_suffix(".mp4")
+            ffmpeg_command = [
+                "ffmpeg",
+                "-i", str(src_video),
+                "-c", "copy",
+                "-y",  # Overwrite output file if it exists
+                str(preprocessed_video_path)
+            ]
+            logging.info(f"Bắt đầu preprocess video: {' '.join(ffmpeg_command)}")
+            try:
+                subprocess.run(ffmpeg_command, check=True, capture_output=True, text=True)
+                logging.info(f"Preprocess video thành công -> {preprocessed_video_path}")
+            except subprocess.CalledProcessError as e:
+                logging.error(f"Lỗi khi chạy ffmpeg cho {src_video}: {e}")
+                logging.error(f"FFMPEG stderr: {e.stderr}")
+                continue
             if mode == "local":
                 # Server trả sẵn result_path (đường dẫn tuyệt đối muốn ghi)
                 result_path = Path(task.get("result_path"))
@@ -290,7 +305,8 @@ def main_loop(server_url: str, videos_dir: Path, mode: Literal['local', 'colab']
                 # Ghi thẳng vào result_path
                 extractor.output_dir = str(result_path.parent)  # extractor có thể tạo subdir <video_id>, ta chỉnh lại:
                 extractor.output_dir = str(result_path)         # => đảm bảo file nằm trong chính result_path
-                extractor.extract_keyframes(str(src_video))
+                # extractor.extract_keyframes(str(src_video))
+                extractor.extract_keyframes(str(preprocessed_video_path)) # NEW
                 # Sau khi extract xong:
                 produced_dir = WorkerConfig.WORKING_DIR / Path(filename).stem
                 target_dir   = WorkerConfig.WORKING_DIR / video_id
@@ -313,8 +329,8 @@ def main_loop(server_url: str, videos_dir: Path, mode: Literal['local', 'colab']
             else:
                 # COLAB: ghi ra thư mục tạm, sau đó upload Base64
                 extractor.output_dir = str(WorkerConfig.WORKING_DIR)
-                extractor.extract_keyframes(str(src_video))
-
+                # extractor.extract_keyframes(str(src_video))
+                extractor.extract_keyframes(str(preprocessed_video_path)) # NEW
                 temp_task_dir = WorkerConfig.WORKING_DIR / video_id
                 if normalize_result_layout(WorkerConfig.WORKING_DIR, video_id) is None:
                     logging.error("Chuẩn hoá layout thất bại (colab).")
@@ -346,7 +362,12 @@ def main_loop(server_url: str, videos_dir: Path, mode: Literal['local', 'colab']
                     shutil.rmtree(temp_task_dir, ignore_errors=True)
                 except Exception:
                     pass
-
+            if preprocessed_video_path and preprocessed_video_path.exists():
+                try:
+                    logging.info(f"Dọn dẹp video đã xử lý: {preprocessed_video_path}")
+                    preprocessed_video_path.unlink()
+                except Exception as e:
+                    logging.error(f"Lỗi dọn dẹp {preprocessed_video_path}: {e}")
             # Giải phóng VRAM/RAM (nếu dùng CUDA)
             try:
                 import torch, gc
