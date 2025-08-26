@@ -740,65 +740,7 @@ class FFmpegReader:
                 raise RuntimeError(f"ffprobe failed for {video_path}. Error: {error_details}")
             except (KeyError, json.JSONDecodeError) as e:
                 raise RuntimeError(f"Failed to parse ffprobe JSON output for {video_path}. Error: {e}")
-
-
-class DiskFrameCache:
-    """
-    Lưu frame theo chỉ số tuyệt đối vào thư mục cache (PNG full-res).
-    Cách đặt tên: frame_abs_{index}.png (index là chỉ số frame gốc trong video).
-    - Lazy mode: get_fullres_path(index) sẽ trích xuất đúng 1 frame nếu file chưa tồn tại.
-    - Có thêm get_downscaled_rgb(indices, size) để rút gọn cho CLIP mà không giữ mọi thứ trong RAM.
-    """
-    def __init__(self, video_path: str, cache_dir: str, owner):
-        self.video_path = video_path
-        self.cache_dir = cache_dir
-        self.owner = owner
-        os.makedirs(self.cache_dir, exist_ok=True)
-
-    def _frame_path(self, idx: int) -> str:
-        return os.path.join(self.cache_dir, f"frame_abs_{idx}.png")
-
-    def get_fullres_path(self, idx: int) -> str:
-        """
-        Đảm bảo có file PNG full-res cho frame idx, trả về path.
-        Trích xuất đúng 1 frame bằng ffmpeg nếu chưa có.
-        """
-        out_path = self._frame_path(idx)
-        if os.path.exists(out_path):
-            return out_path
-
-        # Trích xuất 1 frame theo chỉ số tuyệt đối n=idx
-        # Note: -vf "select='eq(n,idx)'" ; -vframes 1; tránh ghi log dài
-        cmd = [
-            'ffmpeg', '-hide_banner', '-loglevel', 'error',
-            '-i', self.video_path,
-            '-vf', f"select='eq(n\\,{idx})'",
-            '-vsync', 'vfr',
-            '-vframes', '1',
-            out_path
-        ]
-        try:
-            subprocess.run(cmd, check=True)
-        except subprocess.CalledProcessError as e:
-            raise RuntimeError(f"[FrameCache] Failed to extract frame {idx}: {e}")
-        return out_path
-
-    def get_downscaled_rgb(self, abs_indices: List[int], size: Tuple[int, int]) -> List[np.ndarray]:
-        """
-        Lấy danh sách frame RGB downscaled (không lưu file), chỉ giữ các batch nhỏ trong RAM.
-        Dành cho CLIP/SigLIP. Không dùng list all_frames lớn.
-        """
-        # Có thể dùng reader downscale sẵn (như bạn đã làm):
-        # tái sử dụng _read_frames_downscaled_ffmpeg() nếu cần
-        width, height = size
-        if not abs_indices:
-            return []
-        # Ghép với logic bạn đã có để downscale bằng ffmpeg (yuv420p->RGB):
-        frames = self.owner._read_frames_downscaled_ffmpeg(self.video_path, abs_indices, size=size)  # <-- gắn self_owner bên dưới
-        return frames
-
-
-
+            
 class VideoKeyframeExtractor:
     def __init__(self, transnet_weights=None, output_dir="keyframes", 
                  sample_rate=1, max_frames_per_shot=50, model="google/siglip2-base-patch16-384", base_url = "http://192.168.20.170:6660"):
@@ -1026,123 +968,42 @@ class VideoKeyframeExtractor:
 
                 
 
-    def _read_frames_with_ffmpeg(self, video_path: str, indices: List[int]) -> List[np.ndarray]:
+    def _read_frames_with_ffmpeg(self, video_path: str, indices: List[int], output_dir: str) -> List[str]:
         """
-        PASS 2 EXTRACTOR: High-quality extraction for saving/post-processing.
-        - Extracts in BGR24, preserves original resolution.
-        - Robust to VFR and vsync-induced dup/drop.
-        - Uses a filter script to handle a very large number of frames.
-        - Uses threaded I/O to prevent deadlocks.
-        - Waits indefinitely for the ffmpeg process to complete.
+        Extracts specified frames from a video and saves them as PNG files in the given output directory.
+        Returns a list of file paths to the extracted frames.
         """
         if not indices:
             return []
 
-        req_indices = sorted(set(indices))
+        os.makedirs(output_dir, exist_ok=True)
+        select_filter = "+".join([f"eq(n,{i})" for i in indices])
 
-        with self._ffmpeg_lock:
+        command = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-i", video_path,
+            "-vf", f"select='{select_filter}'",
+            "-vsync", "0",
+            os.path.join(output_dir, "frame_%05d.png")
+        ]
+
+        try:
+            subprocess.run(command, check=True)
+            # Return the sorted list of created frame paths
+            return sorted([os.path.join(output_dir, f) for f in os.listdir(output_dir) if f.endswith('.png')])
+        except subprocess.CalledProcessError as e:
+            print(f"[ERROR][FFMPEG] Frame extraction failed: {e}")
+            return []
+
+    def extract_video_frames(self, video_path: str) -> Tuple[List[str], List[int]]:
+        """
+        Extracts frames from a video at a given sample rate using ffmpeg, saving them to a temporary directory.
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
             meta = FFmpegReader.get_metadata(video_path)
-            height, width = int(meta["height"]), int(meta["width"])
-            frame_size = height * width * 3
-
-            select_terms = [f"eq(n\\,{i})" for i in req_indices]
-            select_filter_content = "select='" + "+".join(select_terms) + "'"
-
-            with tempfile.NamedTemporaryFile(mode='w+', encoding='utf-8', delete=True) as tmp_filter_file:
-                tmp_filter_file.write(select_filter_content)
-                tmp_filter_file.flush()
-
-                command = [
-                    "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
-                    "-i", video_path,
-                    "-vsync", "0", "-copyts", "-fflags", "+genpts",
-                    "-filter_script:v", tmp_filter_file.name,
-                    "-pix_fmt", "bgr24", "-sws_flags", "bilinear",
-                    "-f", "rawvideo", "pipe:1",
-                ]
-
-                proc = None
-                frames_bgr: List[np.ndarray] = []
-                try:
-                    proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-
-                    # --- ROBUST I/O HANDLING (No Timeout) ---
-                    stdout_data = bytearray()
-                    stderr_data = bytearray()
-                    
-                    def reader_thread(pipe: Optional[IO[bytes]], buffer: bytearray):
-                        if pipe is None: return
-                        try:
-                            while True:
-                                chunk = pipe.read(4096)
-                                if not chunk:
-                                    break
-                                buffer.extend(chunk)
-                        finally:
-                            pipe.close()
-
-                    stdout_thread = threading.Thread(target=reader_thread, args=(proc.stdout, stdout_data))
-                    stderr_thread = threading.Thread(target=reader_thread, args=(proc.stderr, stderr_data))
-                    stdout_thread.start()
-                    stderr_thread.start()
-
-                    # Wait indefinitely for the threads to finish.
-                    # This happens when ffmpeg closes its output pipes (i.e., when it exits).
-                    stdout_thread.join()
-                    stderr_thread.join()
-                    
-                    # Wait for the process to terminate and get the return code
-                    return_code = proc.wait()
-
-                    # --- END ROBUST I/O HANDLING ---
-
-                    # Now process the captured stdout data
-                    expected = len(req_indices)
-                    for i in range(expected):
-                        offset = i * frame_size
-                        raw = stdout_data[offset : offset + frame_size]
-                        if not raw or len(raw) < frame_size:
-                            break
-                        frame = np.frombuffer(raw, dtype=np.uint8).reshape(height, width, 3).copy()
-                        frames_bgr.append(frame)
-
-                    # Check for errors after the process has finished
-                    if return_code != 0 or len(frames_bgr) != expected:
-                        err_txt = stderr_data.decode("utf-8", errors="ignore").strip()
-                        print(
-                            f"[WARN][FFMPEG select] Process finished with code {return_code}. "
-                            f"Requested {expected} frames, got {len(frames_bgr)}.\n"
-                            f"Command: {' '.join(command)}\n"
-                            f"ffmpeg stderr:\n{err_txt}\n"
-                        )
-
-                    return frames_bgr
-
-                except Exception as e:
-                    print(f"[ERROR][STREAM] ffmpeg extraction failed: {e}")
-                    if proc: proc.kill(); proc.communicate()
-                    return frames_bgr
-                
-                finally:
-                    # Final check to ensure the process is terminated
-                    if proc and proc.poll() is None:
-                        proc.kill()
-                        proc.communicate()
-
-        
-    
-    # Giảm CPU
-
-    def extract_video_frames(self, video_path: str) -> Tuple[List[np.ndarray], List[int]]:
-        """
-        Extracts frames from a video at a given sample rate using ffmpeg.
-        NOTE: This function is not used in the main pipeline but is kept for completeness.
-        """
-        meta = FFmpegReader.get_metadata(video_path)
-        frame_indices = list(range(0, meta['total_frames'], self.sample_rate))
-        frames = self._read_frames_with_ffmpeg(video_path, frame_indices)
-        # Return the indices corresponding to the frames actually read
-        return frames, frame_indices[:len(frames)]
+            frame_indices = list(range(0, meta['total_frames'], self.sample_rate))
+            frame_paths = self._read_frames_with_ffmpeg(video_path, frame_indices, temp_dir)
+            return frame_paths, frame_indices[:len(frame_paths)]
 
         
     def _get_next_frame_count(self):
@@ -1449,7 +1310,7 @@ class VideoKeyframeExtractor:
         # 1. FETCH DOWNSCALED DATA
         try:
             # Use the new function to get small 224x224 frames
-            downscaled_frames = self._cache.get_downscaled_rgb(abs_indices, size=(384, 384))
+            downscaled_frames = self._read_frames_downscaled_ffmpeg(video_path, abs_indices, size=(384, 384))
         except Exception as e:
             print(f"[Worker][Shot {shot_idx+1}] Failed to extract downscaled frames: {e}")
             return shot_idx, []
@@ -1768,46 +1629,36 @@ class VideoKeyframeExtractor:
             
         return all_shot_tasks, all_required_abs_indices
     # <<< MAIN METHOD REFACTORED FOR STREAMING PIPELINE >>>
-    def _process_shot_on_loaded_frames(self, shot_data: Tuple) -> Tuple[int, List[int], List[int]]:
-        shot_idx, scene, all_frames, all_frame_indices, is_last_shot = shot_data
+    def _process_shot_on_loaded_frames(self, shot_data: Tuple) -> Tuple[int, List[int]]:
+        shot_idx, scene, all_frame_paths, all_frame_indices, is_last_shot = shot_data
         start_frame, end_frame = scene
 
-        # 1. Find all relative positions of frames belonging to this shot,
-        #    applying the boundary fix to prevent duplicates.
         if is_last_shot:
-            # For the very last shot, include the end frame.
             rel_positions = [
                 i for i, fidx in enumerate(all_frame_indices) 
                 if start_frame <= fidx <= end_frame
             ]
         else:
-            # For all other shots, use a half-open interval [start, end) to avoid overlap.
             rel_positions = [
                 i for i, fidx in enumerate(all_frame_indices) 
                 if start_frame <= fidx < end_frame
             ]
 
-        # If no sampled frames fall into this shot, we're done.
         if not rel_positions:
-            return shot_idx, [], []
+            return shot_idx, []
 
-        # 2. Sub-sample the frames if the shot is too long, as you suggested.
         if len(rel_positions) > self.max_frames_per_shot:
-            # Calculate a step to select frames evenly across the shot.
             step = max(1, len(rel_positions) // self.max_frames_per_shot)
             sampled_rel_positions = rel_positions[::step]
         else:
             sampled_rel_positions = rel_positions
 
         if not sampled_rel_positions:
-            return shot_idx, [], []
+            return shot_idx, []
 
-        # 3. Slice the pre-loaded frames array to get only the frames for processing.
-        sampled_shot_frames = [all_frames[i] for i in sampled_rel_positions]
+        sampled_shot_frames = [cv2.imread(all_frame_paths[i]) for i in sampled_rel_positions]
 
-        # 4. Run SigLIP & Clustering on the (potentially sub-sampled) in-memory frames.
         shot_features = self.extract_clip_features(sampled_shot_frames, shot_id=shot_idx + 1)
-        # These are indices LOCAL to the `sampled_shot_frames` list.
         keyframe_indices_in_shot = self.adaptive_clustering(shot_features) 
 
         final_absolute_indices = [
@@ -1815,9 +1666,7 @@ class VideoKeyframeExtractor:
             for local_idx in keyframe_indices_in_shot
         ]
 
-        # Return the shot index and the simple list of absolute frame numbers
         return shot_idx, final_absolute_indices
-
     
     def _identify_and_extract_shot_keyframes(self, video_path: str, shot_task_data: dict) -> List[Tuple[np.ndarray, int]]:
         """
@@ -1861,12 +1710,10 @@ class VideoKeyframeExtractor:
             print(f"[Worker][Shot {shot_idx+1}] Failed to extract full-resolution frames: {e}")
             return []
         
+
     def extract_keyframes(self, video_path: str) -> None:
         """
-        A true producer-consumer pipeline for keyframe extraction.
-        1. Producers (shot workers) identify ALL required frame indices in parallel.
-        2. A single, efficient I/O step reads all frames from the video at once.
-        3. Consumers (post-processing workers) handle tagging, OCR, etc., in parallel.
+        A true producer-consumer pipeline for keyframe extraction with disk-based frame caching.
         """
         self._frame_counter = 1
         video_name = os.path.splitext(os.path.basename(video_path))[0]
@@ -1875,200 +1722,165 @@ class VideoKeyframeExtractor:
         if os.path.exists(video_output_dir):
             shutil.rmtree(video_output_dir)
         os.makedirs(video_output_dir, exist_ok=True)
-        # Cache: sinh frame khi cần
-        cache_dir = os.path.join(video_output_dir, "_frame_cache")
-        cache = DiskFrameCache(video_path, cache_dir, owner=self)
         
         print(f"\n[PIPELINE] Starting processing for: {video_path}")
 
-        # --- STAGE 1 (Sequential): Shot Detection & Setup ---
-        fps = self.get_video_fps(video_path)
-        _, single_frame_predictions, _ = self.transnet.predict_video(video_path)
-        scenes_in_prediction_space = self.transnet.predictions_to_scenes(single_frame_predictions)
-        
-        # Scale scenes to original video timeline (your existing logic is correct)
-        total_original_frames = FFmpegReader.get_metadata(video_path)['total_frames']
-        total_prediction_frames = len(single_frame_predictions)
-        scale_factor = total_original_frames / total_prediction_frames
-        print(f"[PIPELINE] Video FPS: {fps:.2f}, Scale factor: {scale_factor:.4f}")
-        scenes = []
-        # ... (your scene scaling logic remains here, unchanged) ...
-        for start_pred, end_pred in scenes_in_prediction_space:
-            original_start = int(start_pred * scale_factor)
-            original_end = int(end_pred * scale_factor)
-            if scenes and original_start < scenes[-1][1]:
-                original_start = scenes[-1][1]
-            if original_end > original_start:
-                scenes.append([original_start, original_end])
-        scenes = np.array(scenes, dtype=np.int32)
-        print(f"[PIPELINE] Scaled to {len(scenes)} shots in original video space.")
-
-        # Preload all sampled frames into RAM for the workers (this is fast)
-        # all_frame_indices = list(range(0, total_original_frames, self.sample_rate))
-        # all_frames = self._read_frames_with_ffmpeg(video_path, all_frame_indices)
-        # print(f"[PIPELINE] Loaded {len(all_frames)} sampled frames into RAM.")
-        all_frame_indices = list(range(0, total_original_frames, self.sample_rate))
-        print(f"[PIPELINE] Sampled {len(all_frame_indices)} frames (step={self.sample_rate}).")
-        
-        # Create a quick lookup map from absolute index to its position in our buffer
-        # frame_index_to_buffer_pos = {frame_idx: pos for pos, frame_idx in enumerate(all_frame_indices)}
-        # --- STAGE 2 (Parallel Producers): Identify All Keyframe Indices ---
-        all_shot_keyframe_indices = {} # Dict to store results: {shot_idx: [indices]}
-        num_cpu_workers = 8
-        print(f"[PIPELINE] Using {num_cpu_workers} workers to find all keyframe indices...")
-
-        # Sửa lại hàm này bên trong extract_keyframes
-        def _process_shot_disk_backed(shot_idx: int, scene: Tuple[int, int]) -> List[int]: # <<< FIX: Sửa lại kiểu trả về
-            start_frame, end_frame = scene
-            shot_abs_indices = [idx for idx in all_frame_indices if start_frame <= idx <= end_frame]
-            if not shot_abs_indices:
-                return []
-
-            SMALL_SIZE = (384, 384)
-            downscaled_frames = cache.get_downscaled_rgb(shot_abs_indices, SMALL_SIZE)
-
-            if not downscaled_frames:
-                return []
-
-            shot_features = self.extract_clip_features(downscaled_frames, shot_id=shot_idx + 1)
-            keyframe_local_indices = self.adaptive_clustering(shot_features)
-            final_abs_indices = sorted([shot_abs_indices[i] for i in keyframe_local_indices])
+        cache_dir = tempfile.mkdtemp()
+        try:
+            fps = self.get_video_fps(video_path)
+            _, single_frame_predictions, _ = self.transnet.predict_video(video_path)
+            scenes_in_prediction_space = self.transnet.predictions_to_scenes(single_frame_predictions)
             
-            # <<< FIX: Xóa bỏ phần xử lý không cần thiết. Chỉ trả về danh sách chỉ số.
-            # results = []
-            # for abs_idx in final_abs_indices:
-            #     ...
-            # return results
-            return final_abs_indices
+            total_original_frames = FFmpegReader.get_metadata(video_path)['total_frames']
+            total_prediction_frames = len(single_frame_predictions)
+            scale_factor = total_original_frames / total_prediction_frames
+            print(f"[PIPELINE] Video FPS: {fps:.2f}, Scale factor: {scale_factor:.4f}")
+            scenes = []
+            for start_pred, end_pred in scenes_in_prediction_space:
+                original_start = int(start_pred * scale_factor)
+                original_end = int(end_pred * scale_factor)
+                if scenes and original_start < scenes[-1][1]:
+                    original_start = scenes[-1][1]
+                if original_end > original_start:
+                    scenes.append([original_start, original_end])
+            scenes = np.array(scenes, dtype=np.int32)
+            print(f"[PIPELINE] Scaled to {len(scenes)} shots in original video space.")
 
-        with ThreadPoolExecutor(max_workers=num_cpu_workers, thread_name_prefix='ShotProc') as shot_executor:
-            shot_futures = {
-                shot_executor.submit(_process_shot_disk_backed, shot_idx, tuple(scene)): shot_idx
-                for shot_idx, scene in enumerate(scenes)
-            }
+            all_frame_indices = list(range(0, total_original_frames, self.sample_rate))
+            all_frame_paths = self._read_frames_with_ffmpeg(video_path, all_frame_indices, cache_dir)
+            all_frame_indices = all_frame_indices[:len(all_frame_paths)]
+            print(f"[PIPELINE] Cached {len(all_frame_paths)} frames to disk.")
 
-            for future in as_completed(shot_futures):
-                shot_idx = shot_futures[future]
-                try:
-                    # <<< FIX: future.result() bây giờ là một List[int], đúng như mong đợi
-                    keyframe_indices_for_shot = future.result()
-                    if keyframe_indices_for_shot:
-                        # <<< FIX: Lưu trữ danh sách chỉ số, không phải tuple
-                        all_shot_keyframe_indices[shot_idx] = keyframe_indices_for_shot
-                        print(f"\r[PIPELINE] Producer for shot {shot_idx+1} finished, found {len(keyframe_indices_for_shot)} keyframes.", end="")
-                except Exception as exc:
-                    print(f'\n[ERROR] Shot producer {shot_idx + 1} generated an exception: {exc}')
+            frame_index_to_path = {frame_idx: path for frame_idx, path in zip(all_frame_indices, all_frame_paths)}
 
-        print("\n[PIPELINE] All shot producers finished.")
-        print(f"[PIPELINE] Total keyframes identified across all shots: {sum(len(v) for v in all_shot_keyframe_indices.values())}")
-        # --- STAGE 3 (Aggregation): Collect all unique indices ---
-        all_unique_indices_to_fetch = set()
-        for shot_idx in sorted(all_shot_keyframe_indices.keys()):
-            for frame_idx in all_shot_keyframe_indices[shot_idx]:
-                all_unique_indices_to_fetch.add(frame_idx)
-        
-        if not all_unique_indices_to_fetch:
-            print("[PIPELINE] No keyframes found for the entire video. Exiting.")
-            return
+            all_shot_keyframe_indices = {}
+            num_cpu_workers = 16
+            print(f"[PIPELINE] Using {num_cpu_workers} workers to find all keyframe indices...")
 
-        # --- STAGE 4 (Single, Efficient I/O): Fetch all frames at once ---
-        print(f"[PIPELINE] Fetching {len(all_unique_indices_to_fetch)} unique full-resolution frames from video...")
-        # frame_data_map = self._read_frames_by_streaming(video_path, list(all_unique_indices_to_fetch))
-        # print(f"[PIPELINE] Successfully fetched {len(frame_data_map)} frames.")
+            with ThreadPoolExecutor(max_workers=num_cpu_workers, thread_name_prefix='ShotProc') as shot_executor:
+                num_scenes = len(scenes)
+                shot_futures = {
+                    shot_executor.submit(
+                        self._process_shot_on_loaded_frames,
+                        (shot_idx, scene, all_frame_paths, all_frame_indices, shot_idx == num_scenes - 1)
+                    ): shot_idx
+                    for shot_idx, scene in enumerate(scenes)
+                }
 
-        # --- STAGE 5 (Parallel Consumers): Post-Processing ---
-        tag_model = self.ram
-        ocr_model = self.ocr_model
-        caption_model = None
-        
-        metadata = {video_name: {}}
-        metadata_stubs = {}
-        all_keyframes_info = []
-        num_post_proc_workers = 8
-        
-        with ThreadPoolExecutor(max_workers=num_post_proc_workers, thread_name_prefix='PostProc') as post_proc_executor:
-            keyframe_batch_buffer = []
-            post_processing_futures = []
+                for future in as_completed(shot_futures):
+                    shot_idx = shot_futures[future]
+                    try:
+                        s_idx, original_indices = future.result()
+                        if original_indices:
+                            all_shot_keyframe_indices[s_idx] = sorted(original_indices)
+                            print(f"\r[PIPELINE] Producer for shot {s_idx+1} finished, found {len(original_indices)} keyframes.", end="")
+                    except Exception as exc:
+                        print(f'\n[ERROR] Shot producer {shot_idx + 1} generated an exception: {exc}')
+            
+            print("\n[PIPELINE] All shot producers finished.")
+            print(f"[PIPELINE] Total keyframes identified across all shots: {sum(len(v) for v in all_shot_keyframe_indices.values())}")
 
-            # Loop through the structured results to prepare and submit batches
+            all_unique_indices_to_fetch = set()
             for shot_idx in sorted(all_shot_keyframe_indices.keys()):
-                for keyframe_idx_in_shot, original_frame_idx in enumerate(all_shot_keyframe_indices[shot_idx]):
-                    
-                    # Lấy full-res từ cache (tự extract nếu thiếu)
-                    fullres_path = cache.get_fullres_path(original_frame_idx)
-                    image = Image.open(fullres_path).convert("RGB")
+                for frame_idx in all_shot_keyframe_indices[shot_idx]:
+                    all_unique_indices_to_fetch.add(frame_idx)
+            
+            if not all_unique_indices_to_fetch:
+                print("[PIPELINE] No keyframes found for the entire video. Exiting.")
+                return
 
-                    frame_name_for_file = f"shot{shot_idx+1:03d}_frame{original_frame_idx:05d}"
-                    keyframe_filename = f"{frame_name_for_file}.png"
-                    keyframe_path = os.path.join(video_output_dir, keyframe_filename)
-                    
-                    timestamp = f"{(original_frame_idx / fps) // 60:02.0f}:{(original_frame_idx / fps) % 60:06.3f}"
-                    metadata_stubs[keyframe_path] = {
-                        "frame_name": frame_name_for_file,
-                        "id": original_frame_idx,
-                        "time-stamp": timestamp,
-                        "shot": shot_idx + 1,
-                    }
+            tag_model = self.ram
+            ocr_model = self.ocr_model
+            caption_model = None
+            
+            metadata = {video_name: {}}
+            metadata_stubs = {}
+            all_keyframes_info = []
+            num_post_proc_workers = 12
+            
+            with ThreadPoolExecutor(max_workers=num_post_proc_workers, thread_name_prefix='PostProc') as post_proc_executor:
+                keyframe_batch_buffer = []
+                post_processing_futures = []
 
-                    image.save(keyframe_path, 'PNG')
-                    keyframe_batch_buffer.append((keyframe_path, image))
-                    all_keyframes_info.append((keyframe_path, shot_idx, keyframe_idx_in_shot, original_frame_idx))
+                for shot_idx in sorted(all_shot_keyframe_indices.keys()):
+                    for keyframe_idx_in_shot, original_frame_idx in enumerate(all_shot_keyframe_indices[shot_idx]):
+                        
+                        cached_frame_path = frame_index_to_path.get(original_frame_idx)
+                        if cached_frame_path is None:
+                            print(f"[WARNING] Could not find frame {original_frame_idx} in cache. Skipping.")
+                            continue
+                        
+                        image = Image.open(cached_frame_path)
+                        
+                        frame_name_for_file = f"shot{shot_idx+1:03d}_frame{original_frame_idx:05d}"
+                        keyframe_filename = f"{frame_name_for_file}.png"
+                        keyframe_path = os.path.join(video_output_dir, keyframe_filename)
+                        
+                        timestamp = f"{(original_frame_idx / fps) // 60:02.0f}:{(original_frame_idx / fps) % 60:06.3f}"
+                        metadata_stubs[keyframe_path] = {
+                            "frame_name": frame_name_for_file,
+                            "id": original_frame_idx,
+                            "time-stamp": timestamp,
+                            "shot": shot_idx + 1,
+                        }
 
-                    if len(keyframe_batch_buffer) >= OCR_BATCH_SIZE:
-                        task_future = post_proc_executor.submit(
-                            self._post_process_batch_concurrently, keyframe_batch_buffer, tag_model, ocr_model, caption_model)
-                        post_processing_futures.append(task_future)
-                        keyframe_batch_buffer = []
+                        image.save(keyframe_path, 'PNG')
+                        keyframe_batch_buffer.append((keyframe_path, image))
+                        all_keyframes_info.append((keyframe_path, shot_idx, keyframe_idx_in_shot, original_frame_idx))
 
-            # Dispatch final batch
-            if keyframe_batch_buffer:
-                task_future = post_proc_executor.submit(
-                    self._post_process_batch_concurrently, keyframe_batch_buffer, tag_model, ocr_model, caption_model)
-                post_processing_futures.append(task_future)
+                        if len(keyframe_batch_buffer) >= OCR_BATCH_SIZE:
+                            task_future = post_proc_executor.submit(
+                                self._post_process_batch_concurrently, keyframe_batch_buffer, tag_model, ocr_model, caption_model)
+                            post_processing_futures.append(task_future)
+                            keyframe_batch_buffer = []
 
-            # --- AGGREGATE RESULTS ---
-            print(f"\n[PIPELINE] All shots processed. Aggregating results from {len(post_processing_futures)} post-processing batches...")
-            for future in as_completed(post_processing_futures):
-                try:
-                    batch_results = future.result()
-                    if not batch_results: continue
+                if keyframe_batch_buffer:
+                    task_future = post_proc_executor.submit(
+                        self._post_process_batch_concurrently, keyframe_batch_buffer, tag_model, ocr_model, caption_model)
+                    post_processing_futures.append(task_future)
 
-                    for keyframe_path, tags, ocr_text, caption in batch_results:
-                        if keyframe_path in metadata_stubs:
-                            stub = metadata_stubs[keyframe_path]
-                            frame_name = stub.pop("frame_name")
-                            metadata[video_name][frame_name] = {
-                                **stub, "tags": tags, "ocr": ocr_text, "caption": caption
-                            }
-                        else:
-                            print(f"[WARNING] Could not find metadata stub for processed keyframe: {keyframe_path}")
-                except Exception as exc:
-                    print(f'[ERROR] A post-processing batch generated an exception: {exc}')
+                print(f"\n[PIPELINE] All shots processed. Aggregating results from {len(post_processing_futures)} post-processing batches...")
+                for future in as_completed(post_processing_futures):
+                    try:
+                        batch_results = future.result()
+                        if not batch_results: continue
 
-        # --- STAGE 4 (Finalization): Validation and Saving ---
-        metadata = self._validate_and_rerun_missing_frames(
-            video_output_dir, metadata, fps, tag_model, ocr_model, caption_model
-        )
-        
-        sorted_frames = sorted(
-            metadata[video_name].items(), 
-            # The key now correctly extracts the numeric part of the frame's name
-            key=lambda item: int(item[0].split('_frame')[1])
-        )
-        metadata[video_name] = dict(sorted_frames)
+                        for keyframe_path, tags, ocr_text, caption in batch_results:
+                            if keyframe_path in metadata_stubs:
+                                stub = metadata_stubs[keyframe_path]
+                                frame_name = stub.pop("frame_name")
+                                metadata[video_name][frame_name] = {
+                                    **stub, "tags": tags, "ocr": ocr_text, "caption": caption
+                                }
+                            else:
+                                print(f"[WARNING] Could not find metadata stub for processed keyframe: {keyframe_path}")
+                    except Exception as exc:
+                        print(f'[ERROR] A post-processing batch generated an exception: {exc}')
 
-        metadata_path = os.path.join(video_output_dir, "metadata.json")
-        with open(metadata_path, "w", encoding='utf-8') as f:
-            json.dump(metadata, f, indent=3, ensure_ascii=False)
-        print(f"[PIPELINE] Metadata saved to {metadata_path}")
-        
-        all_keyframes_info.sort(key=lambda x: (x[1], x[3]))
-        with open(os.path.join(video_output_dir, "keyframes_summary.txt"), "w") as f:
-            f.write(f"Video: {os.path.basename(video_path)}\nTotal shots: {len(scenes)}\nTotal keyframes: {len(all_keyframes_info)}\n\n")
-            for path, s_idx, k_idx, o_idx in all_keyframes_info:
-                f.write(f"{os.path.basename(path)}: Shot {s_idx+1}, Keyframe {k_idx+1}, Original Frame {o_idx}\n")
+            metadata = self._validate_and_rerun_missing_frames(
+                video_output_dir, metadata, fps, tag_model, ocr_model, caption_model
+            )
+            
+            sorted_frames = sorted(
+                metadata[video_name].items(), 
+                key=lambda item: int(item[0].split('_frame')[1])
+            )
+            metadata[video_name] = dict(sorted_frames)
 
-
+            metadata_path = os.path.join(video_output_dir, "metadata.json")
+            with open(metadata_path, "w", encoding='utf-8') as f:
+                json.dump(metadata, f, indent=3, ensure_ascii=False)
+            print(f"[PIPELINE] Metadata saved to {metadata_path}")
+            
+            all_keyframes_info.sort(key=lambda x: (x[1], x[3]))
+            with open(os.path.join(video_output_dir, "keyframes_summary.txt"), "w") as f:
+                f.write(f"Video: {os.path.basename(video_path)}\nTotal shots: {len(scenes)}\nTotal keyframes: {len(all_keyframes_info)}\n\n")
+                for path, s_idx, k_idx, o_idx in all_keyframes_info:
+                    f.write(f"{os.path.basename(path)}\n")
+        finally:
+            shutil.rmtree(cache_dir)
+            print(f"[PIPELINE] Removed temporary cache directory: {cache_dir}")
+            
 def re_ocr_subcommand(output_path: str,
                       video_folder: str,
                       frame_range: str | None,
