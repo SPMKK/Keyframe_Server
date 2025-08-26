@@ -1636,10 +1636,15 @@ class VideoKeyframeExtractor:
         # A. Find metadata entries without a corresponding image file ("zombie" entries)
         missing_images = frames_in_metadata - saved_files
         if missing_images:
-            print(f"[VALIDATION] Found {len(missing_images)} metadata entries with no image file. Removing them.")
-            for frame_name in missing_images:
-                print(f"  - Removing zombie entry: {frame_name}")
-                del metadata[video_name][frame_name]
+            # <<< CHANGED: This block no longer deletes entries. It only warns you.
+            print(f"[VALIDATION] WARNING: Found {len(missing_images)} metadata entries with no matching image file.")
+            # We can print a few examples to help with debugging
+            for i, frame_name in enumerate(list(missing_images)):
+                if i < 5: # Print up to 5 examples
+                    print(f"  - Example of missing file for metadata entry: {frame_name}.png")
+                elif i == 5:
+                    print("  - ... (and possibly more)")
+                    break
             # Update our set of valid metadata keys after deletion
             frames_in_metadata -= missing_images
 
