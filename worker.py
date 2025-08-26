@@ -24,7 +24,7 @@ class WorkerConfig:
     WORKING_DIR: Path = Path("./worker_temp")
 
     SAMPLE_RATE: int = 5
-    MAX_FRAMES_PER_SHOT: int = 55
+    MAX_FRAMES_PER_SHOT: int = 50
 
     POLL_INTERVAL_SECONDS: int = 10
 
