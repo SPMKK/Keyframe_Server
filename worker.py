@@ -12,7 +12,7 @@ import requests
 import subprocess
 # ===== 0) Import extractor =====
 try:
-    from infer_pyav import VideoKeyframeExtractor
+    from infer_ffmpeg import VideoKeyframeExtractor
 except ImportError as e:
     logging.error("Không thể import VideoKeyframeExtractor từ infer_concurent_pytorch.py.")
     raise e
