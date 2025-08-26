@@ -1979,7 +1979,7 @@ class VideoKeyframeExtractor:
         metadata = {video_name: {}}
         metadata_stubs = {}
         all_keyframes_info = []
-        num_post_proc_workers = 12
+        num_post_proc_workers = 8
         
         with ThreadPoolExecutor(max_workers=num_post_proc_workers, thread_name_prefix='PostProc') as post_proc_executor:
             keyframe_batch_buffer = []
