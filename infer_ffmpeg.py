@@ -1909,7 +1909,7 @@ class VideoKeyframeExtractor:
         # frame_index_to_buffer_pos = {frame_idx: pos for pos, frame_idx in enumerate(all_frame_indices)}
         # --- STAGE 2 (Parallel Producers): Identify All Keyframe Indices ---
         all_shot_keyframe_indices = {} # Dict to store results: {shot_idx: [indices]}
-        num_cpu_workers = 16
+        num_cpu_workers = 8
         print(f"[PIPELINE] Using {num_cpu_workers} workers to find all keyframe indices...")
 
         # Sửa lại hàm này bên trong extract_keyframes
