@@ -273,30 +273,12 @@ def main_loop(server_url: str, videos_dir: Path, mode: Literal['local', 'colab']
 
         start = time.time()
         zip_path: Optional[Path] = None
-        preprocessed_video_path: Optional[Path] = None
 
         try:
             logging.info(f"=== Bắt đầu xử lý: {video_id} ===")
+            logging.info(f"Video nguồn: {src_video}")
 
-            # 1) PREPROCESS: ép tên file đầu vào thành {video_id}.mp4
-            preprocessed_video_path = (WorkerConfig.WORKING_DIR / video_id).with_suffix(".mp4")
-            ffmpeg_command = [
-                "ffmpeg", "-hide_banner", "-loglevel", "error",
-                "-i", str(src_video),
-                "-c", "copy",
-                "-y",
-                str(preprocessed_video_path)
-            ]
-            logging.info(f"Bắt đầu preprocess video: {' '.join(ffmpeg_command)}")
-            try:
-                subprocess.run(ffmpeg_command, check=True, capture_output=True, text=True)
-                logging.info(f"Preprocess video thành công -> {preprocessed_video_path}")
-            except subprocess.CalledProcessError as e:
-                logging.error(f"Lỗi khi chạy ffmpeg cho {src_video}: {e}")
-                logging.error(f"FFMPEG stderr: {e.stderr}")
-                continue
-
-            # 2) Thiết lập output_dir sao cho extractor tạo đúng thư mục {video_id}
+            # 1) Thiết lập output_dir sao cho extractor tạo đúng thư mục {video_id}
             if mode == "local":
                 # Server đưa sẵn result_path (kỳ vọng là .../<video_id>)
                 result_path = Path(task.get("result_path"))
@@ -312,21 +294,21 @@ def main_loop(server_url: str, videos_dir: Path, mode: Literal['local', 'colab']
                 result_path.parent.mkdir(parents=True, exist_ok=True)
                 extractor.output_dir = str(result_path.parent)
 
-                # 3) Extract
-                extractor.extract_keyframes(str(preprocessed_video_path))
+                # 2) Extract
+                extractor.extract_keyframes(str(src_video))
 
-                # 4) Chuẩn hoá layout (đưa webp ra thẳng <video_id>/, xoá keyframes/)
+                # 3) Chuẩn hoá layout (đưa webp ra thẳng <video_id>/, xoá keyframes/)
                 if normalize_result_layout(result_path.parent, video_id) is None:
                     logging.error("Chuẩn hoá layout thất bại (local).")
                     continue
 
-                # 5) Báo hoàn thành
+                # 4) Báo hoàn thành
                 report_completion_to_server(server_url, video_id)
 
             else:
                 # COLAB: ghi tại WORKING_DIR/<video_id>
                 extractor.output_dir = str(WorkerConfig.WORKING_DIR)
-                extractor.extract_keyframes(str(preprocessed_video_path))
+                extractor.extract_keyframes(str(src_video))
 
                 if normalize_result_layout(WorkerConfig.WORKING_DIR, video_id) is None:
                     logging.error("Chuẩn hoá layout thất bại (colab).")
@@ -352,13 +334,15 @@ def main_loop(server_url: str, videos_dir: Path, mode: Literal['local', 'colab']
             if zip_path and zip_path.exists():
                 try: zip_path.unlink()
                 except Exception: pass
-
-            if preprocessed_video_path and preprocessed_video_path.exists():
+            
+            # Dọn dẹp thư mục kết quả trong WORKING_DIR để tránh đầy đĩa
+            result_dir_in_worker = WorkerConfig.WORKING_DIR / video_id
+            if result_dir_in_worker.exists():
                 try:
-                    logging.info(f"Dọn dẹp video đã xử lý: {preprocessed_video_path}")
-                    preprocessed_video_path.unlink()
+                    logging.info(f"Dọn dẹp thư mục kết quả tạm: {result_dir_in_worker}")
+                    shutil.rmtree(result_dir_in_worker)
                 except Exception as e:
-                    logging.error(f"Lỗi dọn dẹp {preprocessed_video_path}: {e}")
+                    logging.error(f"Lỗi dọn dẹp {result_dir_in_worker}: {e}")
 
             # Giải phóng VRAM/RAM
             try:
@@ -370,7 +354,6 @@ def main_loop(server_url: str, videos_dir: Path, mode: Literal['local', 'colab']
                 pass
 
             time.sleep(2)
-
 
 # ===== 7) Entry =====
 if __name__ == "__main__":
