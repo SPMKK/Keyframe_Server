@@ -91,6 +91,23 @@ def report_completion_to_server(server_url: str, video_id: str) -> bool:
         return False
 
 
+def report_partial_result_to_server(server_url: str, video_id: str, metadata_json: str) -> bool:
+    """
+    Fallback: Báo cáo lỗi nhưng gửi kèm metadata.json để server có thể ghi nhận.
+    """
+    url = f"{server_url.rstrip('/')}/report_partial"
+    payload = {"video_id": video_id, "metadata_json": metadata_json}
+    try:
+        logging.warning(f"FALLBACK: Gửi metadata cho task lỗi -> {url} (video_id={video_id})")
+        r = requests.post(url, json=payload, timeout=WorkerConfig.REQ_TIMEOUT_REPORT)
+        r.raise_for_status()
+        logging.warning(f"Server xác nhận fallback: {r.json()}")
+        return True
+    except requests.RequestException as e:
+        logging.error(f"Lỗi gửi fallback metadata {video_id}: {e}")
+        return False
+
+
 # ===== 4) Chuẩn hoá & đóng gói kết quả =====
 def _list_webps(dir_path: Path) -> List[Path]:
     return sorted([p for p in dir_path.iterdir() if p.is_file() and p.suffix.lower() == ".png"])
@@ -217,6 +234,13 @@ def upload_results_base64_batched(server_url: str, video_id: str, root_output_di
             logging.error(f"Upload batch {i+1} lỗi: {e}")
             if getattr(e, "response", None) is not None:
                 logging.error(f"Chi tiết server: {e.response.text}")
+
+            # FALLBACK: Nếu lỗi xảy ra ở các batch sau batch đầu tiên (đã gửi metadata),
+            # gửi lại metadata để server có thể ghi nhận kết quả xử lý được một phần.
+            if i > 0:
+                logging.warning("Thực hiện fallback: gửi metadata cho task đã upload được một phần.")
+                report_partial_result_to_server(server_url, video_id, metadata_text)
+
             return False
 
     logging.info(f"Upload Base64 hoàn tất cho {video_id}.")
