@@ -9,12 +9,12 @@ from typing import Dict, Optional, Literal, List
 import base64
 import zipfile
 import requests
-
+import subprocess
 # ===== 0) Import extractor =====
 try:
-    from infer_concurent_pytorch import VideoKeyframeExtractor
+    from infer_ffmpeg import VideoKeyframeExtractor
 except ImportError as e:
-    logging.error("Không thể import VideoKeyframeExtractor từ infer_concurrent_autoshot.py.")
+    logging.error("Không thể import VideoKeyframeExtractor từ infer_concurent_pytorch.py.")
     raise e
 
 
@@ -24,12 +24,12 @@ class WorkerConfig:
     WORKING_DIR: Path = Path("./worker_temp")
 
     SAMPLE_RATE: int = 5
-    MAX_FRAMES_PER_SHOT: int = 55
+    MAX_FRAMES_PER_SHOT: int = 50
 
     POLL_INTERVAL_SECONDS: int = 10
 
     # Số ảnh gửi mỗi batch base64
-    BASE64_BATCH_SIZE: int = 8
+    BASE64_BATCH_SIZE: int = 4
 
     # Timeout HTTP
     REQ_TIMEOUT_GET: int = 15
@@ -91,9 +91,26 @@ def report_completion_to_server(server_url: str, video_id: str) -> bool:
         return False
 
 
+def report_partial_result_to_server(server_url: str, video_id: str, metadata_json: str) -> bool:
+    """
+    Fallback: Báo cáo lỗi nhưng gửi kèm metadata.json để server có thể ghi nhận.
+    """
+    url = f"{server_url.rstrip('/')}/report_partial"
+    payload = {"video_id": video_id, "metadata_json": metadata_json}
+    try:
+        logging.warning(f"FALLBACK: Gửi metadata cho task lỗi -> {url} (video_id={video_id})")
+        r = requests.post(url, json=payload, timeout=WorkerConfig.REQ_TIMEOUT_REPORT)
+        r.raise_for_status()
+        logging.warning(f"Server xác nhận fallback: {r.json()}")
+        return True
+    except requests.RequestException as e:
+        logging.error(f"Lỗi gửi fallback metadata {video_id}: {e}")
+        return False
+
+
 # ===== 4) Chuẩn hoá & đóng gói kết quả =====
 def _list_webps(dir_path: Path) -> List[Path]:
-    return sorted([p for p in dir_path.iterdir() if p.is_file() and p.suffix.lower() == ".webp"])
+    return sorted([p for p in dir_path.iterdir() if p.is_file() and p.suffix.lower() == ".png"])
 
 
 def normalize_result_layout(root_output_dir: Path, video_id: str) -> Optional[Path]:
@@ -136,7 +153,7 @@ def normalize_result_layout(root_output_dir: Path, video_id: str) -> Optional[Pa
     # Chỉ giữ file .webp ở ngay dưới <video_id>/
     webps = _list_webps(vid_dir)
     if not webps:
-        logging.error(f"Không tìm thấy file .webp nào trong {vid_dir}")
+        logging.error(f"Không tìm thấy file .png nào trong {vid_dir}")
         return None
 
     logging.info(f"Chuẩn hoá layout OK: {vid_dir} (webp={len(webps)})")
@@ -217,6 +234,13 @@ def upload_results_base64_batched(server_url: str, video_id: str, root_output_di
             logging.error(f"Upload batch {i+1} lỗi: {e}")
             if getattr(e, "response", None) is not None:
                 logging.error(f"Chi tiết server: {e.response.text}")
+
+            # FALLBACK: Nếu lỗi xảy ra ở các batch sau batch đầu tiên (đã gửi metadata),
+            # gửi lại metadata để server có thể ghi nhận kết quả xử lý được một phần.
+            if i > 0:
+                logging.warning("Thực hiện fallback: gửi metadata cho task đã upload được một phần.")
+                report_partial_result_to_server(server_url, video_id, metadata_text)
+
             return False
 
     logging.info(f"Upload Base64 hoàn tất cho {video_id}.")
@@ -249,10 +273,10 @@ def main_loop(server_url: str, videos_dir: Path, mode: Literal['local', 'colab']
     logging.info("Khởi tạo VideoKeyframeExtractor...")
     extractor = VideoKeyframeExtractor(
         transnet_weights="transnetv2-pytorch-weights.pth",
-        output_dir=str(WorkerConfig.WORKING_DIR),
+        output_dir=str(WorkerConfig.WORKING_DIR),  # sẽ set lại trước khi extract
         sample_rate=WorkerConfig.SAMPLE_RATE,
         max_frames_per_shot=WorkerConfig.MAX_FRAMES_PER_SHOT,
-        base_url=base_url
+        base_url=base_url,
     )
     logging.info("Extractor sẵn sàng.")
 
@@ -273,50 +297,56 @@ def main_loop(server_url: str, videos_dir: Path, mode: Literal['local', 'colab']
 
         start = time.time()
         zip_path: Optional[Path] = None
-        temp_task_dir: Optional[Path] = None
 
         try:
             logging.info(f"=== Bắt đầu xử lý: {video_id} ===")
+            logging.info(f"Video nguồn: {src_video}")
 
+            # 1) Thiết lập output_dir sao cho extractor tạo đúng thư mục {video_id}
             if mode == "local":
-                # Server trả sẵn result_path (đường dẫn tuyệt đối muốn ghi)
+                # Server đưa sẵn result_path (kỳ vọng là .../<video_id>)
                 result_path = Path(task.get("result_path"))
                 if not result_path:
                     logging.error("Thiếu result_path từ server (mode=local).")
                     continue
-                result_path.mkdir(parents=True, exist_ok=True)
 
-                # Ghi thẳng vào result_path
-                extractor.output_dir = str(result_path.parent)  # extractor có thể tạo subdir <video_id>, ta chỉnh lại:
-                extractor.output_dir = str(result_path)         # => đảm bảo file nằm trong chính result_path
+                # Đảm bảo path kết thúc bằng <video_id>
+                if result_path.name != video_id:
+                    result_path = result_path / video_id
+
+                # Cho extractor ghi vào parent, extractor sẽ tạo subfolder <video_id>
+                result_path.parent.mkdir(parents=True, exist_ok=True)
+                extractor.output_dir = str(result_path.parent)
+
+                # 2) Extract
                 extractor.extract_keyframes(str(src_video))
 
-                # Chuẩn hoá layout ngay tại result_path
-                if normalize_result_layout(result_path.parent if result_path.name == video_id else result_path, video_id) is None:
+                # 3) Chuẩn hoá layout (đưa webp ra thẳng <video_id>/, xoá keyframes/)
+                if normalize_result_layout(result_path.parent, video_id) is None:
                     logging.error("Chuẩn hoá layout thất bại (local).")
                     continue
 
-                # Báo server validate + COMPLETE
+                # 4) Báo hoàn thành
                 report_completion_to_server(server_url, video_id)
 
             else:
-                # COLAB: ghi ra thư mục tạm, sau đó upload Base64
+                # COLAB: ghi tại WORKING_DIR/<video_id>
                 extractor.output_dir = str(WorkerConfig.WORKING_DIR)
                 extractor.extract_keyframes(str(src_video))
 
-                temp_task_dir = WorkerConfig.WORKING_DIR / video_id
                 if normalize_result_layout(WorkerConfig.WORKING_DIR, video_id) is None:
                     logging.error("Chuẩn hoá layout thất bại (colab).")
                     continue
 
-                # Ưu tiên Base64 theo thiết kế server
+                # Ưu tiên upload Base64
                 ok = upload_results_base64_batched(server_url, video_id, WorkerConfig.WORKING_DIR)
                 if not ok:
-                    logging.error("Upload Base64 thất bại. Thử phương án ZIP (fallback).")
-                    # Fallback: ZIP
+                    logging.error("Upload Base64 thất bại. Thử ZIP (fallback).")
                     zip_path = create_flat_zip_for_server(WorkerConfig.WORKING_DIR, video_id, WorkerConfig.WORKING_DIR)
                     if zip_path:
-                        upload_zip_to_server(server_url, video_id, zip_path)
+                        ok = upload_zip_to_server(server_url, video_id, zip_path)
+                if ok:
+                    report_completion_to_server(server_url, video_id)
 
             logging.info(f"Xử lý '{video_id}' xong trong {time.time() - start:.2f}s")
 
@@ -324,19 +354,30 @@ def main_loop(server_url: str, videos_dir: Path, mode: Literal['local', 'colab']
             logging.error(f"Lỗi xử lý task {video_id}: {e}", exc_info=True)
 
         finally:
-            # Dọn dẹp
+            # Dọn dẹp file tạm
             if zip_path and zip_path.exists():
+                try: zip_path.unlink()
+                except Exception: pass
+            
+            # Dọn dẹp thư mục kết quả trong WORKING_DIR để tránh đầy đĩa
+            result_dir_in_worker = WorkerConfig.WORKING_DIR / video_id
+            if result_dir_in_worker.exists():
                 try:
-                    zip_path.unlink()
-                except Exception:
-                    pass
-            if mode == "colab" and temp_task_dir and temp_task_dir.exists():
-                try:
-                    shutil.rmtree(temp_task_dir, ignore_errors=True)
-                except Exception:
-                    pass
-            time.sleep(2)
+                    logging.info(f"Dọn dẹp thư mục kết quả tạm: {result_dir_in_worker}")
+                    shutil.rmtree(result_dir_in_worker)
+                except Exception as e:
+                    logging.error(f"Lỗi dọn dẹp {result_dir_in_worker}: {e}")
 
+            # Giải phóng VRAM/RAM
+            try:
+                import torch, gc
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                gc.collect()
+            except Exception:
+                pass
+
+            time.sleep(2)
 
 # ===== 7) Entry =====
 if __name__ == "__main__":
@@ -344,13 +385,13 @@ if __name__ == "__main__":
         description="Worker xử lý video, trích xuất keyframe và gửi kết quả về server.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
-    parser.add_argument("--server-url", type=str, default="http://127.0.0.1:6661",
-                        help="URL Task Dispatcher Server (vd: http://host:6661)")
+    parser.add_argument("--server-url", type=str, default="http://127.0.0.1:6060",
+                        help="URL Task Dispatcher Server (vd: http://host:6060)")
     parser.add_argument("--videos-dir", type=str, required=True,
                         help="Thư mục chứa video nguồn (share được cho worker).")
     parser.add_argument("--mode", type=str, choices=["local", "colab"], default="colab",
                         help="local: ghi trực tiếp vào result_path và /report_done; colab: upload Base64.")
-    parser.add_argument("--base-url", type=str, default="http://159.223.81.229:8000",
+    parser.add_argument("--base-url", type=str, default="http://159.223.81.229:9600",
                         help="Tham số truyền cho extractor (nếu có dùng).")
 
     args = parser.parse_args()
